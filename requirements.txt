@@ -1,3 +1,5 @@
-flask
-groq
+Flask
 gunicorn
+groq
+openai
+python-dotenv
