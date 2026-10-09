@@ -1,5 +1,8 @@
-Flask
+flask
 gunicorn
 groq
 openai
 python-dotenv
+gtts
+PyPDF2
+python-docx
