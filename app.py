@@ -17,7 +17,7 @@ HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device
 <style>
 body{background:#0a0a0a;color:white;font-family:system-ui;margin:0;padding:0;display:flex;flex-direction:column;height:100vh}
 .header{padding:14px;text-align:center;border-bottom:1px solid #222}
-h1{color:#FFD700;font-size:32px;margin:0}
+h1{color:#FFD700;font-size:32px;margin:0;display:flex;align-items:center;justify-content:center;gap:8px}
 .sub{color:#aaa;font-size:13px;margin-top:4px}
 #chat{flex:1;overflow-y:auto;padding:16px;max-width:850px;width:100%;margin:0 auto;box-sizing:border-box}
 .msg{padding:14px 18px;border-radius:18px;margin:8px 0;max-width:85%;line-height:1.7;word-wrap:break-word;font-size:14.5px;white-space:pre-wrap}
@@ -30,7 +30,7 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 .btn{padding:12px 16px;background:#FFD700;color:black;border:none;border-radius:12px;font-weight:bold;cursor:pointer}
 .btn2{background:#333;color:white}
 </style></head><body>
-<div class="header"><h1>MORR AI GH 🇬🇭</h1><div class="sub">Smart AI • Chat • Images • Files • Like ChatGPT</div></div>
+<div class="header"><h1>MORR AI GH <img src="https://flagcdn.com/w20/gh.png" style="width:24px;height:18px;border-radius:3px;vertical-align:middle" alt="GH"></h1><div class="sub">Smart AI • Chat • Images • Files • Like ChatGPT</div></div>
 <div id="chat"></div>
 <div class="input-area">
 <div id="status" style="color:#FFD700;font-size:12px;margin-top:6px"></div>
@@ -99,7 +99,7 @@ async function toggleMic(){
  if(data.text){document.getElementById('q').value=data.text;await sendText();} };
  recorder.start();recording=true;btn.innerText="🔴";}else{recorder.stop();recording=false;btn.innerText="🎤";}}
 document.getElementById('q').addEventListener('keypress',function(e){if(e.key==='Enter')sendText();});
-addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭\\nGhana\\'s Smart Assistant for Business & Afro Culture.\\nI help with chat, images, files and voice — what would you like to do today?');
+addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭\\nGhana\\'s Smart Assistant for Studies, Business & Afro culture\\nI help with chat, images, files and voice — what would you like to do today?');
 </script></body></html>"""
 
 def build_prompt(lang, has_file=False):
