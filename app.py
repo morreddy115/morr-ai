@@ -57,23 +57,24 @@ function addMsg(role, text, isHtml=false){
 }
 function isImageRequest(q){
  q=q.toLowerCase();
- return q.includes('generate image')||q.includes('create image')||q.includes('generate a image')||q.includes('draw')||q.includes('picture of')||q.includes('photo of')||q.includes('image of')||q.includes('/image')||q.includes('generate picture')||q.includes('create picture');
+ return q.includes('generate image')||q.includes('create image')||q.includes('draw')||q.includes('picture of')||q.includes('photo of')||q.includes('image of')||q.includes('/image')||q.includes('generate picture');
 }
 async function sendText(){
  let input=document.getElementById('q'); let q=input.value.trim(); if(!q &&!uploadedText) return;
  if(q) addMsg('user', q);
  input.value='';
  if(isImageRequest(q)){
-   let prompt = q.replace(/generate image of/gi,'').replace(/create image of/gi,'').replace(/generate image/gi,'').replace(/create image/gi,'').replace(/generate picture/gi,'').replace(/draw/gi,'').replace(/picture of/gi,'').replace(/image of/gi,'').replace(/photo of/gi,'').replace(/\\/image/gi,'').trim();
-   if(!prompt) prompt = q;
-   document.getElementById('status').innerText="🎨 MORR is generating image via higher AI model...";
+   let prompt = q.replace(/generate image of/gi,'').replace(/create image of/gi,'').replace(/generate image/gi,'').replace(/create image/gi,'').replace(/generate picture/gi,'').replace(/draw/gi,'').replace(/picture of/gi,'').replace(/image of/gi,'').replace(/photo of/gi,'').replace(/\\/image/gi,'').trim() || q;
+   document.getElementById('status').innerText="🎨 MORR generating image (free model)...";
    let p = encodeURIComponent(prompt);
+   // Primary = turbo (still free), Backup = Unsplash real photo (100% free unlimited, no payment ever)
    let imgUrl = `https://image.pollinations.ai/prompt/${p}?model=turbo&width=512&height=512&nologo=true&seed=${Date.now()}`;
-   let fallback = `https://loremflickr.com/512/512/${p}?lock=${Date.now()}`;
+   let backup1 = `https://source.unsplash.com/512x512/?${p}`;
+   let backup2 = `https://loremflickr.com/512/512/${p}`;
    setTimeout(()=>{
      document.getElementById('status').innerText="";
-     addMsg('ai', `🎨 Here is your image for: <b>${prompt}</b><br><img src="${imgUrl}" onerror="this.onerror=null;this.src='${fallback}'" style="max-width:100%;border-radius:12px;margin-top:10px;border:1px solid #333"><br><a href="${imgUrl}" target="_blank" style="color:#FFD700">📥 Download Image</a>`, true);
-   }, 600);
+     addMsg('ai', `🎨 Here is your image for: <b>${prompt}</b><br><img src="${imgUrl}" onerror="this.onerror=null; this.src='${backup1}'; this.onerror=function(){this.src='${backup2}'}" style="max-width:100%;border-radius:12px;margin-top:10px;border:1px solid #333"><br><a href="${imgUrl}" target="_blank" style="color:#FFD700">📥 Download</a>`, true);
+   }, 500);
    return;
  }
  document.getElementById('status').innerText="MORR dey think via higher AI...";
@@ -84,9 +85,9 @@ async function sendText(){
   document.getElementById('status').innerText="";
   let answer = data.answer || "Sorry, try again.";
   if(data.image_url){
-    addMsg('ai', answer + `<br><img src="${data.image_url}" onerror="this.onerror=null;this.src='https://loremflickr.com/512/512/${encodeURIComponent(q)}'" style="max-width:100%;border-radius:12px;margin-top:10px"><br><a href="${data.image_url}" target="_blank" style="color:#FFD700">📥 Download</a>`, true);
+    addMsg('ai', answer + `<br><img src="${data.image_url}" onerror="this.src='https://source.unsplash.com/512x512/?${encodeURIComponent(q)}'" style="max-width:100%;border-radius:12px;margin-top:10px"><br><a href="${data.image_url}" target="_blank" style="color:#FFD700">📥 Download</a>`, true);
   } else if(data.file_url){
-    addMsg('ai', answer + `<br><a href="${data.file_url}" target="_blank" style="color:#FFD700;font-weight:bold">📄 Download your file: ${data.file_name}</a>`, true);
+    addMsg('ai', answer + `<br><a href="${data.file_url}" target="_blank" style="color:#FFD700;font-weight:bold">📄 Download: ${data.file_name}</a>`, true);
   } else {
     addMsg('ai', answer, true);
   }
@@ -101,7 +102,7 @@ async function handleFile(){
  let fd=new FormData(); fd.append('file',file);
  let res=await fetch('/upload',{method:'POST',body:fd}); let data=await res.json();
  uploadedText = data.text || "";
- document.getElementById('status').innerText="✅ "+file.name+" attached - now ask";
+ document.getElementById('status').innerText="✅ "+file.name+" attached";
 }
 async function toggleMic(){
  let btn=document.getElementById('micBtn');
@@ -118,149 +119,87 @@ if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js');}
 
 def build_prompt(lang, has_file=False):
     return f"""You are MORR AI GH. Ghana's Smart Assistant for Studies, Business & Afro culture. Date: May 13, 2026. Language: {lang}.
-STRICT RULES:
-- You CAN generate images and files. NEVER say "text-only", "I don't have capability to create images", "I cannot generate images". FORBIDDEN.
-- If user asks image, say "Here is your image:" - frontend will show it.
-- If user asks file/pdf/doc, say "Here is your file ready for download".
-- You work like Meta AI / Gemini: you receive user instruction, send to higher model, collect info, give to user.
+- You CAN generate images and files. NEVER say text-only. FORBIDDEN.
 - Be helpful, concise.
-File context: {has_file}"""
+File:{has_file}"""
 
 @app.route("/")
 def home(): return render_template_string(HTML)
-
 @app.route("/manifest.json")
 def manifest():
-    return jsonify({
-        "name": "MORR AI GH",
-        "short_name": "MORR GH",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#0a0a0a",
-        "theme_color": "#FFD700",
-        "icons": [{"src":"https://flagcdn.com/w192/gh.png","sizes":"192x192","type":"image/png"}]
-    })
-
+    return jsonify({"name":"MORR AI GH","short_name":"MORR GH","start_url":"/","display":"standalone","background_color":"#0a0a0a","theme_color":"#FFD700","icons":[{"src":"https://flagcdn.com/w192/gh.png","sizes":"192x192","type":"image/png"}]})
 @app.route("/sw.js")
-def sw():
-    return "self.addEventListener('fetch', e=>{});", 200, {'Content-Type':'application/javascript'}
-
+def sw(): return "self.addEventListener('fetch',e=>{});",200,{'Content-Type':'application/javascript'}
 @app.route("/upload", methods=["POST"])
 def upload():
     f=request.files.get('file')
     if not f: return jsonify({"text":""})
-    name=f.filename.lower()
-    tmp=os.path.join(tempfile.gettempdir(), f.filename)
-    f.save(tmp)
-    text=""
+    name=f.filename.lower(); tmp=os.path.join(tempfile.gettempdir(), f.filename); f.save(tmp); text=""
     try:
         if name.endswith(('.png','.jpg','.jpeg','.webp')): text=f"[IMAGE: {f.filename}]"
         elif name.endswith('.pdf'):
-            import PyPDF2
-            reader=PyPDF2.PdfReader(tmp)
-            text=" ".join([p.extract_text() or "" for p in reader.pages[:10]])
+            import PyPDF2; r=PyPDF2.PdfReader(tmp); text=" ".join([p.extract_text() or "" for p in r.pages[:10]])
         elif name.endswith(('.txt','.csv','.py','.js','.html','.json','.md')):
             with open(tmp,'r',errors='ignore') as file: text=file.read()[:8000]
         elif name.endswith('.docx'):
-            import docx
-            doc=docx.Document(tmp)
-            text=" ".join([p.text for p in doc.paragraphs])[:8000]
+            import docx; doc=docx.Document(tmp); text=" ".join([p.text for p in doc.paragraphs])[:8000]
         else: text=f"[File {f.filename}]"
     except: text=f"[File {f.filename}]"
     return jsonify({"text":text[:8000]})
-
 @app.route("/ask", methods=["POST"])
 def ask():
-    d=request.get_json()
-    q_raw=d.get("question","")
-    q=q_raw.lower()
-    lang=d.get("language","English")
-    file_ctx=d.get("file_context","")
-    history=d.get("history",[])[:10]
-
-    # IMAGE ROUTING - FREE TURBO MODEL (no payment)
-    image_keywords = ["generate image","create image","draw","picture of","image of","photo of","/image","generate picture","create picture"]
-    if any(k in q for k in image_keywords):
-        prompt = q_raw
-        for k in ["generate image of","create image of","generate image","create image","generate picture","create picture","draw","picture of","image of","photo of","/image"]:
-            prompt = prompt.lower().replace(k,"")
-        prompt = prompt.strip() or "beautiful Ghanaian scene"
-        clean = urllib.parse.quote(prompt)
-        img_url = f"https://image.pollinations.ai/prompt/{clean}?model=turbo&width=512&height=512&nologo=true&seed={abs(hash(prompt)) % 1000000}"
-        return jsonify({"answer": f"🎨 Here is your image for: <b>{prompt}</b> — generated via higher AI image model (turbo free, like Meta AI).", "image_url": img_url})
-
-    # FILE GENERATION
+    d=request.get_json(); q_raw=d.get("question",""); q=q_raw.lower(); lang=d.get("language","English"); file_ctx=d.get("file_context",""); history=d.get("history",[])[:10]
+    if any(k in q for k in ["generate image","create image","draw","picture of","image of","photo of","/image","generate picture"]):
+        prompt=q_raw
+        for k in ["generate image of","create image of","generate image","create image","generate picture","create picture","draw","picture of","image of","photo of","/image"]: prompt=prompt.lower().replace(k,"")
+        prompt=prompt.strip() or "beautiful Ghanaian scene"; clean=urllib.parse.quote(prompt)
+        img_url=f"https://image.pollinations.ai/prompt/{clean}?model=turbo&width=512&height=512&nologo=true&seed={abs(hash(prompt))%1000000}"
+        return jsonify({"answer":f"🎨 Here is your image for: <b>{prompt}</b>","image_url":img_url})
     if any(k in q for k in ["create pdf","generate pdf","create document","create file","generate file","create docx","create doc"]):
         try:
-            c_path = os.path.join(tempfile.gettempdir(), "morr_doc.pdf")
+            c_path=os.path.join(tempfile.gettempdir(),"morr_doc.pdf")
             try:
-                from reportlab.pdfgen import canvas
-                c = canvas.Canvas(c_path)
-                c.setFont("Helvetica-Bold", 16)
-                c.drawString(80,750,"MORR AI GH - Document")
-                c.setFont("Helvetica", 11)
-                c.drawString(80,720,f"Topic: {q_raw[:120]}")
-                c.drawString(80,700,"Generated by MORR AI GH - Studies, Business & Afro culture")
-                y=670
-                words = q_raw.split()
-                for i in range(0, min(len(words), 200), 12):
-                    c.drawString(80,y," ".join(words[i:i+12]))
-                    y-=18
-                    if y<50: break
+                from reportlab.pdfgen import canvas; c=canvas.Canvas(c_path); c.setFont("Helvetica-Bold",16); c.drawString(80,750,"MORR AI GH - Document"); c.setFont("Helvetica",11); c.drawString(80,720,f"Topic: {q_raw[:120]}"); c.drawString(80,700,"Generated by MORR AI GH"); y=670; words=q_raw.split()
+                for i in range(0,min(len(words),200),12): c.drawString(80,y," ".join(words[i:i+12])); y-=18
+                if y<50: break
                 c.save()
-            except:
-                with open(c_path,"w") as fw: fw.write(f"MORR AI GH Document\n{q_raw}")
-            return jsonify({"answer": f"📄 I have created your document for: {q_raw}", "file_url": "/download/morr_doc.pdf", "file_name": "morr_doc.pdf"})
-        except Exception as e:
-            return jsonify({"answer": f"File creation error: {e}"})
-
-    # CHAT -> Higher AI model - NEW MODELS (llama3-8b-8192 is dead)
-    messages=[{"role":"system","content":build_prompt(lang, bool(file_ctx))}]
+            except: open(c_path,"w").write(f"MORR AI GH Document\n{q_raw}")
+            return jsonify({"answer":f"📄 Created: {q_raw}","file_url":"/download/morr_doc.pdf","file_name":"morr_doc.pdf"})
+        except Exception as e: return jsonify({"answer":f"File error: {e}"})
+    messages=[{"role":"system","content":build_prompt(lang,bool(file_ctx))}]
     for h in history: messages.append(h)
-    messages.append({"role":"user","content": (f"FILE:{file_ctx}\nQ:{q_raw}" if file_ctx else q_raw)})
-
+    messages.append({"role":"user","content":(f"FILE:{file_ctx}\nQ:{q_raw}" if file_ctx else q_raw)})
     ans=None; last_err=""
-    for model_name in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]:
+    for model_name in ["llama-3.3-70b-versatile","llama-3.1-8b-instant","gemma2-9b-it"]:
         try:
-            resp=client.chat.completions.create(model=model_name, messages=messages, temperature=0.3, max_tokens=900)
-            ans = resp.choices[0].message.content
+            resp=client.chat.completions.create(model=model_name,messages=messages,temperature=0.3,max_tokens=900)
+            ans=resp.choices[0].message.content
             if ans and ans.strip(): break
-        except Exception as e:
-            last_err=str(e); continue
-    if not ans: ans = f"Sorry, connection issue: {last_err}. Please try again."
-
+        except Exception as e: last_err=str(e); continue
+    if not ans: ans=f"Connection issue: {last_err}. Try again."
     try:
-        fn=f"morr_{lang}.mp3"; fp=os.path.join(os.path.dirname(__file__), fn)
-        if HAS_GTTS:
-            gTTS(text=ans[:300], lang='en').save(fp)
-            audio=f"/audio/{fn}"
+        fn=f"morr_{lang}.mp3"; fp=os.path.join(os.path.dirname(__file__),fn)
+        if HAS_GTTS: gTTS(text=ans[:300],lang='en').save(fp); audio=f"/audio/{fn}"
         else: audio=None
     except: audio=None
     return jsonify({"answer":ans,"audio_url":audio})
-
 @app.route("/voice", methods=["POST"])
 def voice():
-    f=request.files.get("audio")
-    tmp=os.path.join(tempfile.gettempdir(),"in.webm")
-    if f: f.save(tmp)
-    txt=""
+    f=request.files.get("audio"); tmp=os.path.join(tempfile.gettempdir(),"in.webm")
+    if f: f.save(tmp); txt=""
     try:
-        with open(tmp,"rb") as af:
-            txt=client.audio.transcriptions.create(model="whisper-large-v3", file=af).text
+        with open(tmp,"rb") as af: txt=client.audio.transcriptions.create(model="whisper-large-v3",file=af).text
     except: txt=""
     return jsonify({"text":txt or "Hi"})
-
 @app.route("/download/<filename>")
 def download_file(filename):
-    p=os.path.join(tempfile.gettempdir(), filename)
-    if os.path.exists(p): return send_file(p, as_attachment=True)
+    p=os.path.join(tempfile.gettempdir(),filename)
+    if os.path.exists(p): return send_file(p,as_attachment=True)
     return "not found",404
-
 @app.route("/audio/<filename>")
 def serve_audio(filename):
-    p=os.path.join(os.path.dirname(__file__), filename)
-    if os.path.exists(p): return send_file(p, mimetype="audio/mpeg")
+    p=os.path.join(os.path.dirname(__file__),filename)
+    if os.path.exists(p): return send_file(p,mimetype="audio/mpeg")
     return "not found",404
-
 if __name__=="__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",5000)))
