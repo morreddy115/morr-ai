@@ -1,4 +1,4 @@
-import os, tempfile
+import os, tempfile, urllib.parse
 from flask import Flask, render_template_string, request, jsonify, send_file
 app = Flask(__name__)
 
@@ -13,7 +13,8 @@ except:
     HAS_GTTS = False
 
 HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MORR AI GH 🇬🇭</title>
+<title>MORR AI GH</title>
+<link rel="manifest" href="/manifest.json">
 <style>
 body{background:#0a0a0a;color:white;font-family:system-ui;margin:0;padding:0;display:flex;flex-direction:column;height:100vh}
 .header{padding:14px;text-align:center;border-bottom:1px solid #222}
@@ -30,7 +31,7 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 .btn{padding:12px 16px;background:#FFD700;color:black;border:none;border-radius:12px;font-weight:bold;cursor:pointer}
 .btn2{background:#333;color:white}
 </style></head><body>
-<div class="header"><h1>MORR AI GH <img src="https://flagcdn.com/w20/gh.png" style="width:24px;height:18px;border-radius:3px;vertical-align:middle" alt="GH"></h1><div class="sub">Smart AI • Chat • Images • Files • Like ChatGPT</div></div>
+<div class="header"><h1>MORR AI GH <img src="https://flagcdn.com/w20/gh.png" style="width:24px;height:18px;border-radius:3px;vertical-align:middle" alt="GH"></h1><div class="sub">Smart AI • Chat • Images • Files • Like Meta AI</div></div>
 <div id="chat"></div>
 <div class="input-area">
 <div id="status" style="color:#FFD700;font-size:12px;margin-top:6px"></div>
@@ -38,7 +39,7 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 <select id="lang"><option>English</option><option>Pidgin</option><option>Twi</option><option>Hausa</option></select>
 <input type="file" id="fileInput" hidden onchange="handleFile()">
 <button class="btn btn2" onclick="document.getElementById('fileInput').click()">📎</button>
-<input id="q" placeholder="Ask anything...">
+<input id="q" placeholder="Ask anything or 'generate image of...'">
 <button class="btn" onclick="sendText()">➤</button>
 <button class="btn btn2" id="micBtn" onclick="toggleMic()">🎤</button>
 </div>
@@ -47,40 +48,50 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 <script>
 let chatHistory = []; let uploadedText = "";
 let recorder,chunks=[],recording=false;
-function addMsg(role, text){
+function addMsg(role, text, isHtml=false){
  let chat=document.getElementById('chat');
  let div=document.createElement('div'); div.className='msg '+role;
- if(!text ||!text.trim()){ text = "Sorry, I didn't get a response. Please try again."; }
- div.innerHTML = text.replace(/\\n/g,'<br>');
+ if(!text ||!text.trim()){ text = "Sorry, try again."; }
+ if(isHtml){ div.innerHTML = text; } else { div.innerHTML = text.replace(/\\n/g,'<br>'); }
  chat.appendChild(div); chat.scrollTop=chat.scrollHeight;
+}
+function isImageRequest(q){
+ q=q.toLowerCase();
+ return q.includes('generate image')||q.includes('create image')||q.includes('generate a image')||q.includes('draw')||q.includes('picture of')||q.includes('photo of')||q.includes('image of')||q.includes('/image')||q.includes('generate picture')||q.includes('create picture');
 }
 async function sendText(){
  let input=document.getElementById('q'); let q=input.value.trim(); if(!q &&!uploadedText) return;
  if(q) addMsg('user', q);
  input.value='';
- document.getElementById('status').innerText="MORR dey think...";
- if(q.toLowerCase().startsWith('generate image') || q.toLowerCase().startsWith('create image') || q.toLowerCase().includes('/image')){
-   let prompt = q.replace(/generate image of/i,'').replace(/create image of/i,'').replace('/image','').trim();
-   let imgUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&seed=${Date.now()}`;
-   document.getElementById('status').innerText="";
-   let chat=document.getElementById('chat');
-   let div=document.createElement('div'); div.className='msg ai';
-   div.innerHTML = `🎨 Generated: ${prompt}<br><img src="${imgUrl}" style="max-width:100%;border-radius:12px;margin-top:10px">`;
-   chat.appendChild(div); chat.scrollTop=chat.scrollHeight;
+ if(isImageRequest(q)){
+   let prompt = q.replace(/generate image of/gi,'').replace(/create image of/gi,'').replace(/generate image/gi,'').replace(/create image/gi,'').replace(/generate picture/gi,'').replace(/draw/gi,'').replace(/picture of/gi,'').replace(/image of/gi,'').replace(/photo of/gi,'').replace(/\\/image/gi,'').trim();
+   if(!prompt) prompt = q;
+   document.getElementById('status').innerText="🎨 MORR is generating image via higher AI model...";
+   let imgUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&enhance=true&seed=${Date.now()}`;
+   setTimeout(()=>{
+     document.getElementById('status').innerText="";
+     addMsg('ai', `🎨 Here is your image for: <b>${prompt}</b><br><img src="${imgUrl}" style="max-width:100%;border-radius:12px;margin-top:10px;border:1px solid #333"><br><a href="${imgUrl}" target="_blank" style="color:#FFD700">📥 Download Image</a>`, true);
+   }, 600);
    return;
  }
+ document.getElementById('status').innerText="MORR dey think via higher AI...";
  try{
   let res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify({question:q, file_context: uploadedText, language: document.getElementById('lang').value, history: chatHistory})});
   let data=await res.json();
   document.getElementById('status').innerText="";
-  let answer = (data.answer && data.answer.trim())? data.answer : "Sorry, Groq timed out. Please ask again.";
-  addMsg('ai', answer);
+  let answer = data.answer || "Sorry, try again.";
+  if(data.image_url){
+    addMsg('ai', answer + `<br><img src="${data.image_url}" style="max-width:100%;border-radius:12px;margin-top:10px"><br><a href="${data.image_url}" target="_blank" style="color:#FFD700">📥 Download</a>`, true);
+  } else if(data.file_url){
+    addMsg('ai', answer + `<br><a href="${data.file_url}" target="_blank" style="color:#FFD700;font-weight:bold">📄 Download your file: ${data.file_name}</a>`, true);
+  } else {
+    addMsg('ai', answer, true);
+  }
   chatHistory.push({role:'user',content:q},{role:'assistant',content:answer});
   if(data.audio_url){let p=document.getElementById('player');p.style.display='block';p.src=data.audio_url+"?t="+Date.now();}
- }catch(e){ document.getElementById('status').innerText=""; addMsg('ai', "Network error, try again: "+e); }
- uploadedText="";
- document.getElementById('fileInput').value="";
+ }catch(e){ document.getElementById('status').innerText=""; addMsg('ai', "Network error: "+e); }
+ uploadedText=""; document.getElementById('fileInput').value="";
 }
 async function handleFile(){
  let file=document.getElementById('fileInput').files[0]; if(!file) return;
@@ -99,23 +110,38 @@ async function toggleMic(){
  if(data.text){document.getElementById('q').value=data.text;await sendText();} };
  recorder.start();recording=true;btn.innerText="🔴";}else{recorder.stop();recording=false;btn.innerText="🎤";}}
 document.getElementById('q').addEventListener('keypress',function(e){if(e.key==='Enter')sendText();});
-addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭\\nGhana\\'s Smart Assistant for Studies, Business & Afro culture\\nI help with chat, images, files and voice — what would you like to do today?');
+addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭<br>Ghana\\'s Smart Assistant for Studies, Business & Afro culture<br>I help with chat, images, files and voice — what would you like to do today?', true);
+if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js');}
 </script></body></html>"""
 
 def build_prompt(lang, has_file=False):
-    extra = " File provided." if has_file else ""
-    return f"""You are MORR AI GH 🇬🇭. Date: May 13, 2026. Answer in {lang}. Never return empty, always answer helpfully.
-
-FACTS:
-- Ghana President: John Dramani Mahama (Jan 7 2025-present), VP: Prof Jane Naana Opoku-Agyemang, First Lady: Lordina Mahama
-- Nigeria President: Bola Tinubu, First Lady: Oluremi Tinubu
-- NDC Chairman: Johnson Asiedu Nketiah, General Secretary: Fifi Kwetey, Vice Chairmen include: Sherry Ayittey, Said Sinare, etc. (NDC structure changes, advise verify from NDC official site)
-- Always answer even if not 100% sure, add "verify from official source".
-
-Be concise, accurate. {extra}"""
+    return f"""You are MORR AI GH. Ghana's Smart Assistant for Studies, Business & Afro culture. Date: May 13, 2026. Language: {lang}.
+STRICT RULES:
+- You CAN generate images and files. NEVER say "text-only", "I don't have capability to create images", "I cannot generate images". FORBIDDEN.
+- If user asks image, say "Here is your image:" - frontend will show it.
+- If user asks file/pdf/doc, say "Here is your file ready for download".
+- You work like Meta AI / Gemini: you receive user instruction, send to higher model, collect info, give to user.
+- Be helpful, concise.
+File context: {has_file}"""
 
 @app.route("/")
 def home(): return render_template_string(HTML)
+
+@app.route("/manifest.json")
+def manifest():
+    return jsonify({
+        "name": "MORR AI GH",
+        "short_name": "MORR GH",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#0a0a0a",
+        "theme_color": "#FFD700",
+        "icons": [{"src":"https://flagcdn.com/w192/gh.png","sizes":"192x192","type":"image/png"}]
+    })
+
+@app.route("/sw.js")
+def sw():
+    return "self.addEventListener('fetch', e=>{});", 200, {'Content-Type':'application/javascript'}
 
 @app.route("/upload", methods=["POST"])
 def upload():
@@ -144,45 +170,69 @@ def upload():
 @app.route("/ask", methods=["POST"])
 def ask():
     d=request.get_json()
-    q=d.get("question","").lower()
+    q_raw=d.get("question","")
+    q=q_raw.lower()
     lang=d.get("language","English")
     file_ctx=d.get("file_context","")
     history=d.get("history",[])[:10]
-    hardcoded = None
-    if "first lady of nigeria" in q:
-        hardcoded = "The current First Lady of Nigeria (as of 2026) is **Senator Oluremi Tinubu**, wife of President Bola Ahmed Tinubu (since May 29, 2023). 🇳🇬"
-    elif "vice chairman of ndc" in q or "vice chairman of n d c" in q:
-        hardcoded = "As of 2026, NDC National Chairman is **Johnson Asiedu Nketiah**. Vice Chairmen include **Dr. Sherry Ayittey** (late), **Said Sinare, Awudu Sofo Azorka, Abanga Yakubu Alhassan**, etc. Structure changes often — please verify from official NDC Ghana website for the latest list. 🇬🇭"
 
-    full_q = f"FILE:{file_ctx}\nQ:{d.get('question','')}" if file_ctx else d.get('question','')
+    # IMAGE ROUTING TO HIGHER MODEL (unlimited)
+    image_keywords = ["generate image","create image","draw","picture of","image of","photo of","/image","generate picture","create picture"]
+    if any(k in q for k in image_keywords):
+        prompt = q_raw
+        for k in ["generate image of","create image of","generate image","create image","generate picture","create picture","draw","picture of","image of","photo of","/image"]:
+            prompt = prompt.lower().replace(k,"")
+        prompt = prompt.strip() or "beautiful Ghanaian scene"
+        img_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1024&height=1024&nologo=true&enhance=true&seed={abs(hash(prompt)) % 1000000}"
+        return jsonify({"answer": f"🎨 Here is your image for: <b>{prompt}</b> — generated via higher AI image model like Meta AI / Gemini (Stable Diffusion XL unlimited).", "image_url": img_url})
+
+    # FILE GENERATION ROUTING
+    if any(k in q for k in ["create pdf","generate pdf","create document","create file","generate file","create docx","create doc"]):
+        try:
+            c_path = os.path.join(tempfile.gettempdir(), "morr_doc.pdf")
+            try:
+                from reportlab.pdfgen import canvas
+                c = canvas.Canvas(c_path)
+                c.setFont("Helvetica-Bold", 16)
+                c.drawString(80,750,"MORR AI GH - Document")
+                c.setFont("Helvetica", 11)
+                c.drawString(80,720,f"Topic: {q_raw[:120]}")
+                c.drawString(80,700,"Generated by MORR AI GH - Studies, Business & Afro culture")
+                y=670
+                words = q_raw.split()
+                for i in range(0, min(len(words), 200), 12):
+                    c.drawString(80,y," ".join(words[i:i+12]))
+                    y-=18
+                    if y<50: break
+                c.save()
+            except:
+                with open(c_path,"w") as fw: fw.write(f"MORR AI GH Document\n{q_raw}")
+            return jsonify({"answer": f"📄 I have created your document for: {q_raw}", "file_url": "/download/morr_doc.pdf", "file_name": "morr_doc.pdf"})
+        except Exception as e:
+            return jsonify({"answer": f"File creation error: {e}"})
+
+    # NORMAL CHAT -> Higher AI model (Groq brain like Meta AI)
     messages=[{"role":"system","content":build_prompt(lang, bool(file_ctx))}]
     for h in history: messages.append(h)
-    messages.append({"role":"user","content":full_q})
+    messages.append({"role":"user","content": (f"FILE:{file_ctx}\nQ:{q_raw}" if file_ctx else q_raw)})
 
-    ans = hardcoded
-    last_err = ""
-    if not ans:
-        for model_name in ["llama-3.3-70b-versatile", "llama3-8b-8192", "openai/gpt-oss-120b"]:
-            try:
-                resp=client.chat.completions.create(model=model_name, messages=messages, temperature=0.2, max_tokens=800)
-                ans = resp.choices[0].message.content
-                if ans and ans.strip():
-                    break
-            except Exception as e:
-                last_err = str(e)
-                continue
-    if not ans or not ans.strip():
-        ans = hardcoded or f"Sorry, I'm having trouble reaching Groq right now. Last error: {last_err}. But for your question: If you asked about First Lady of Nigeria, it's Oluremi Tinubu. If NDC vice chairman, it's Johnson Asiedu Nketiah's team. Please try again."
+    ans=None; last_err=""
+    for model_name in ["llama-3.3-70b-versatile", "llama3-8b-8192"]:
+        try:
+            resp=client.chat.completions.create(model=model_name, messages=messages, temperature=0.3, max_tokens=900)
+            ans = resp.choices[0].message.content
+            if ans and ans.strip(): break
+        except Exception as e:
+            last_err=str(e); continue
+    if not ans: ans = f"Sorry, connection issue: {last_err}. Please try again."
 
     try:
         fn=f"morr_{lang}.mp3"; fp=os.path.join(os.path.dirname(__file__), fn)
         if HAS_GTTS:
             gTTS(text=ans[:300], lang='en').save(fp)
             audio=f"/audio/{fn}"
-        else:
-            audio=None
-    except:
-        audio=None
+        else: audio=None
+    except: audio=None
     return jsonify({"answer":ans,"audio_url":audio})
 
 @app.route("/voice", methods=["POST"])
@@ -194,15 +244,19 @@ def voice():
     try:
         with open(tmp,"rb") as af:
             txt=client.audio.transcriptions.create(model="whisper-large-v3", file=af).text
-    except:
-        txt=""
+    except: txt=""
     return jsonify({"text":txt or "Hi"})
+
+@app.route("/download/<filename>")
+def download_file(filename):
+    p=os.path.join(tempfile.gettempdir(), filename)
+    if os.path.exists(p): return send_file(p, as_attachment=True)
+    return "not found",404
 
 @app.route("/audio/<filename>")
 def serve_audio(filename):
     p=os.path.join(os.path.dirname(__file__), filename)
-    if os.path.exists(p):
-        return send_file(p, mimetype="audio/mpeg")
+    if os.path.exists(p): return send_file(p, mimetype="audio/mpeg")
     return "not found",404
 
 if __name__=="__main__":
