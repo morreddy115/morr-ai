@@ -1,4 +1,4 @@
-import os, tempfile, base64
+import os, tempfile
 from flask import Flask, render_template_string, request, jsonify, send_file
 app = Flask(__name__)
 
@@ -13,12 +13,11 @@ except:
     HAS_GTTS = False
 
 HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MORR AI GH - Smart AI</title>
+<title>MORR AI GH 🇬🇭</title>
 <style>
 body{background:#0a0a0a;color:white;font-family:system-ui;margin:0;padding:0;display:flex;flex-direction:column;height:100vh}
 .header{padding:14px;text-align:center;border-bottom:1px solid #222}
-h1{color:#FFD700;font-size:30px;margin:0;letter-spacing:1px}
-h1 span{font-size:28px}
+h1{color:#FFD700;font-size:32px;margin:0}
 .sub{color:#aaa;font-size:13px;margin-top:4px}
 #chat{flex:1;overflow-y:auto;padding:16px;max-width:850px;width:100%;margin:0 auto;box-sizing:border-box}
 .msg{padding:14px 18px;border-radius:18px;margin:8px 0;max-width:85%;line-height:1.7;white-space:pre-wrap;word-wrap:break-word;font-size:14.5px}
@@ -33,7 +32,7 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 .btn2{background:#333;color:white}
 #fileName{color:#FFD700;font-size:12px;margin:4px 0}
 </style></head><body>
-<div class="header"><h1>MORR AI GH <span>🇬🇭</span></h1><div class="sub">Smart AI • Chat • Images • Files • Like ChatGPT</div></div>
+<div class="header"><h1>MORR AI GH 🇬🇭</h1><div class="sub">Smart AI • Chat • Images • Files • Like ChatGPT</div></div>
 <div id="chat"></div>
 <div class="input-area">
 <div id="fileName"></div>
@@ -79,7 +78,6 @@ async function sendText(){
   addMsg('ai', data.answer);
   chatHistory.push({role:'user',content:q},{role:'assistant',content:data.answer});
   if(data.audio_url){let p=document.getElementById('player');p.style.display='block';p.src=data.audio_url+"?t="+Date.now();}
-  if(data.download_url){ addMsg('ai', `📄 File ready: <a href='${data.download_url}' target='_blank' style='color:#FFD700'>Download ${data.download_name}</a>`); }
  }catch(e){ document.getElementById('status').innerText="Error, try again"; }
  clearFile();
 }
@@ -101,23 +99,20 @@ async function toggleMic(){
  if(data.text){document.getElementById('q').value=data.text;await sendText();} };
  recorder.start();recording=true;btn.innerText="🔴";}else{recorder.stop();recording=false;btn.innerText="🎤";}}
 document.getElementById('q').addEventListener('keypress',function(e){if(e.key==='Enter')sendText();});
-addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭\\nUpdated & Accurate now!\\n• Chat like ChatGPT\\n• Generate images\\n• Read files\\nWhat should we do today?');
+addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭\\nFixed & Accurate!\\n• Current President: John Mahama (2025)\\n• Ask me anything!\\nWhat should we do today?');
 </script></body></html>"""
 
 def build_prompt(lang, has_file=False):
-    extra = " The user also uploaded a file. Use its content." if has_file else ""
-    return f"""You are MORR AI GH, Ghana's most accurate AI assistant. Current date: October 9, 2026.
+    extra = " File provided, use it." if has_file else ""
+    return f"""You are MORR AI GH, Ghana's accurate assistant. TODAY IS: October 2026.
 
-CRITICAL KNOWLEDGE UPDATE - YOU MUST USE THIS:
-- Ghana President (as of Jan 7, 2025 to now 2026): John Dramani Mahama (NDC)
-- Vice President: Prof. Jane Naana Opoku-Agyemang
-- Previous President: Nana Akufo-Addo (2017-2025)
-- Nigeria President: Bola Ahmed Tinubu
-- USA President (as of Jan 2025): Donald Trump (2nd term)
-- Never say Akufo-Addo is current. Always give up-to-date info.
-- If you are not sure, say "As of my last update in 2026..." and tell user to verify on official Ghana government website.
+MUST KNOW (CURRENT 2026):
+- Ghana President: John Dramani Mahama (started Jan 7, 2025). Vice: Jane Naana Opoku-Agyemang. Previous: Nana Akufo-Addo (2017-Jan 2025).
+- Never say Akufo-Addo is current president.
+- Nigeria: Bola Tinubu. USA: Donald Trump (2nd term from Jan 2025).
+- If unsure, say you will verify but give 2026 context.
 
-You are friendly, teacher-like, accurate. Never hallucinate dates. Answer in {lang}. Be concise, accurate, step-by-step. Under 350 words. {extra} 🇬🇭"""
+Answer in {lang}, accurate, short, friendly. {extra} 🇬🇭"""
 
 @app.route("/")
 def home(): return render_template_string(HTML)
@@ -131,51 +126,45 @@ def upload():
     f.save(tmp)
     text=""
     try:
-        if name.endswith(('.png','.jpg','.jpeg','.webp')):
-            text=f"[IMAGE UPLOADED: {f.filename}]"
+        if name.endswith(('.png','.jpg','.jpeg','.webp')): text=f"[IMAGE: {f.filename}]"
         elif name.endswith('.pdf'):
-            try:
-                import PyPDF2
-                reader=PyPDF2.PdfReader(tmp)
-                text="\\n".join([p.extract_text() for p in reader.pages[:10]])
-            except: text="[PDF uploaded]"
+            import PyPDF2
+            reader=PyPDF2.PdfReader(tmp)
+            text="\\n".join([p.extract_text() for p in reader.pages[:10]])
         elif name.endswith(('.txt','.csv','.py','.js','.html','.json','.md')):
             with open(tmp,'r',errors='ignore') as file: text=file.read()[:8000]
         elif name.endswith('.docx'):
-            try:
-                import docx
-                doc=docx.Document(tmp)
-                text="\\n".join([p.text for p in doc.paragraphs])[:8000]
-            except: text="[DOCX uploaded]"
-        else: text=f"[File: {f.filename}]"
-    except Exception as e: text=f"[File {f.filename} error: {e}]"
+            import docx
+            doc=docx.Document(tmp)
+            text="\\n".join([p.text for p in doc.paragraphs])[:8000]
+        else: text=f"[File {f.filename}]"
+    except: text=f"[File {f.filename}]"
     return jsonify({"text":text[:8000]})
 
 @app.route("/ask", methods=["POST"])
 def ask():
     d=request.get_json(); q=d.get("question",""); lang=d.get("language","English")
     file_ctx=d.get("file_context",""); history=d.get("history",[])[:10]
-    full_q = f"FILE:\\n{file_ctx}\\n\\nQUESTION: {q}" if file_ctx else q
+    full_q = f"FILE:{file_ctx}\\nQ:{q}" if file_ctx else q
     messages=[{"role":"system","content":build_prompt(lang, bool(file_ctx))}]
     for h in history: messages.append(h)
     messages.append({"role":"user","content":full_q})
-    ans="Error"; download_url=None; download_name=None
-    try:
-        model = "llama-3.3-70b-versatile"
-        resp=client.chat.completions.create(model=model, messages=messages, temperature=0.3, max_tokens=1200)
-        ans=resp.choices[0].message.content
-    except Exception as e:
+    ans="Error"
+    # TRY CORRECT GROQ MODELS
+    for model_name in ["llama-3.3-70b-versatile", "llama3-8b-8192", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]:
         try:
-            resp=client.chat.completions.create(model="llama-3.1-8b-instant", messages=messages, temperature=0.3, max_tokens=1200)
+            resp=client.chat.completions.create(model=model_name, messages=messages, temperature=0.2, max_tokens=1200)
             ans=resp.choices[0].message.content
-        except Exception as e2:
-            ans=f"Error: {e2}"
+            break
+        except Exception as e:
+            ans=f"Retrying... {e}"
+            continue
     try:
         fn=f"morr_{lang}.mp3"; fp=os.path.join(os.path.dirname(__file__), fn)
         if HAS_GTTS: gTTS(text=ans[:300], lang='en').save(fp); audio=f"/audio/{fn}"
         else: audio=None
     except: audio=None
-    return jsonify({"answer":ans,"audio_url":audio,"download_url":download_url,"download_name":download_name})
+    return jsonify({"answer":ans,"audio_url":audio})
 
 @app.route("/voice", methods=["POST"])
 def voice():
@@ -184,8 +173,7 @@ def voice():
     try:
         with open(tmp,"rb") as af: txt=client.audio.transcriptions.create(model="whisper-large-v3", file=af).text
     except: txt=""
-    if not txt: txt="Hi"
-    return jsonify({"text":txt,"language":lang})
+    return jsonify({"text":txt or "Hi"})
 
 @app.route("/audio/<filename>")
 def serve_audio(filename):
