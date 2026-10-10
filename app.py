@@ -13,7 +13,7 @@ except:
     HAS_GTTS = False
 
 HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MORR AI GH Flag</title>
+<title>MORR AI GH 🇬🇭</title>
 <style>
 body{background:#0a0a0a;color:white;font-family:system-ui;margin:0;padding:0;display:flex;flex-direction:column;height:100vh}
 .header{padding:14px;text-align:center;border-bottom:1px solid #222}
@@ -99,7 +99,7 @@ async function toggleMic(){
  if(data.text){document.getElementById('q').value=data.text;await sendText();} };
  recorder.start();recording=true;btn.innerText="🔴";}else{recorder.stop();recording=false;btn.innerText="🎤";}}
 document.getElementById('q').addEventListener('keypress',function(e){if(e.key==='Enter')sendText();});
-addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭\\n✅ No more empty replies!\\nAsk me: current first lady of Nigeria, etc.');
+addMsg('ai','Akwaaba! I am MORR AI GH 🇬🇭\\nGhana\\'s Smart Assistant for Business & Afro Culture.\\nI help with chat, images, files and voice — what would you like to do today?');
 </script></body></html>"""
 
 def build_prompt(lang, has_file=False):
@@ -148,7 +148,6 @@ def ask():
     lang=d.get("language","English")
     file_ctx=d.get("file_context","")
     history=d.get("history",[])[:10]
-    # HARD FALLBACK FOR YOUR 2 FAILING QUESTIONS
     hardcoded = None
     if "first lady of nigeria" in q:
         hardcoded = "The current First Lady of Nigeria (as of 2026) is **Senator Oluremi Tinubu**, wife of President Bola Ahmed Tinubu (since May 29, 2023). 🇳🇬"
