@@ -67,10 +67,12 @@ async function sendText(){
    let prompt = q.replace(/generate image of/gi,'').replace(/create image of/gi,'').replace(/generate image/gi,'').replace(/create image/gi,'').replace(/generate picture/gi,'').replace(/draw/gi,'').replace(/picture of/gi,'').replace(/image of/gi,'').replace(/photo of/gi,'').replace(/\\/image/gi,'').trim();
    if(!prompt) prompt = q;
    document.getElementById('status').innerText="🎨 MORR is generating image via higher AI model...";
-   let imgUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=1024&height=1024&nologo=true&enhance=true&seed=${Date.now()}`;
+   let p = encodeURIComponent(prompt);
+   let imgUrl = `https://image.pollinations.ai/prompt/${p}?model=turbo&width=512&height=512&nologo=true&seed=${Date.now()}`;
+   let fallback = `https://loremflickr.com/512/512/${p}?lock=${Date.now()}`;
    setTimeout(()=>{
      document.getElementById('status').innerText="";
-     addMsg('ai', `🎨 Here is your image for: <b>${prompt}</b><br><img src="${imgUrl}" style="max-width:100%;border-radius:12px;margin-top:10px;border:1px solid #333"><br><a href="${imgUrl}" target="_blank" style="color:#FFD700">📥 Download Image</a>`, true);
+     addMsg('ai', `🎨 Here is your image for: <b>${prompt}</b><br><img src="${imgUrl}" onerror="this.onerror=null;this.src='${fallback}'" style="max-width:100%;border-radius:12px;margin-top:10px;border:1px solid #333"><br><a href="${imgUrl}" target="_blank" style="color:#FFD700">📥 Download Image</a>`, true);
    }, 600);
    return;
  }
@@ -82,7 +84,7 @@ async function sendText(){
   document.getElementById('status').innerText="";
   let answer = data.answer || "Sorry, try again.";
   if(data.image_url){
-    addMsg('ai', answer + `<br><img src="${data.image_url}" style="max-width:100%;border-radius:12px;margin-top:10px"><br><a href="${data.image_url}" target="_blank" style="color:#FFD700">📥 Download</a>`, true);
+    addMsg('ai', answer + `<br><img src="${data.image_url}" onerror="this.onerror=null;this.src='https://loremflickr.com/512/512/${encodeURIComponent(q)}'" style="max-width:100%;border-radius:12px;margin-top:10px"><br><a href="${data.image_url}" target="_blank" style="color:#FFD700">📥 Download</a>`, true);
   } else if(data.file_url){
     addMsg('ai', answer + `<br><a href="${data.file_url}" target="_blank" style="color:#FFD700;font-weight:bold">📄 Download your file: ${data.file_name}</a>`, true);
   } else {
@@ -176,17 +178,18 @@ def ask():
     file_ctx=d.get("file_context","")
     history=d.get("history",[])[:10]
 
-    # IMAGE ROUTING TO HIGHER MODEL (unlimited)
+    # IMAGE ROUTING - FREE TURBO MODEL (no payment)
     image_keywords = ["generate image","create image","draw","picture of","image of","photo of","/image","generate picture","create picture"]
     if any(k in q for k in image_keywords):
         prompt = q_raw
         for k in ["generate image of","create image of","generate image","create image","generate picture","create picture","draw","picture of","image of","photo of","/image"]:
             prompt = prompt.lower().replace(k,"")
         prompt = prompt.strip() or "beautiful Ghanaian scene"
-        img_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?width=1024&height=1024&nologo=true&enhance=true&seed={abs(hash(prompt)) % 1000000}"
-        return jsonify({"answer": f"🎨 Here is your image for: <b>{prompt}</b> — generated via higher AI image model like Meta AI / Gemini (Stable Diffusion XL unlimited).", "image_url": img_url})
+        clean = urllib.parse.quote(prompt)
+        img_url = f"https://image.pollinations.ai/prompt/{clean}?model=turbo&width=512&height=512&nologo=true&seed={abs(hash(prompt)) % 1000000}"
+        return jsonify({"answer": f"🎨 Here is your image for: <b>{prompt}</b> — generated via higher AI image model (turbo free, like Meta AI).", "image_url": img_url})
 
-    # FILE GENERATION ROUTING
+    # FILE GENERATION
     if any(k in q for k in ["create pdf","generate pdf","create document","create file","generate file","create docx","create doc"]):
         try:
             c_path = os.path.join(tempfile.gettempdir(), "morr_doc.pdf")
@@ -211,13 +214,13 @@ def ask():
         except Exception as e:
             return jsonify({"answer": f"File creation error: {e}"})
 
-    # NORMAL CHAT -> Higher AI model (Groq brain like Meta AI)
+    # CHAT -> Higher AI model - NEW MODELS (llama3-8b-8192 is dead)
     messages=[{"role":"system","content":build_prompt(lang, bool(file_ctx))}]
     for h in history: messages.append(h)
     messages.append({"role":"user","content": (f"FILE:{file_ctx}\nQ:{q_raw}" if file_ctx else q_raw)})
 
     ans=None; last_err=""
-    for model_name in ["llama-3.3-70b-versatile", "llama3-8b-8192"]:
+    for model_name in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]:
         try:
             resp=client.chat.completions.create(model=model_name, messages=messages, temperature=0.3, max_tokens=900)
             ans = resp.choices[0].message.content
