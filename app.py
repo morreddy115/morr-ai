@@ -3,18 +3,16 @@ import tempfile
 import uuid
 import urllib.parse
 from flask import Flask, render_template_string, request, jsonify, send_file
-import google.generativeai as genai
+from google import genai
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
+client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
-# Use the most stable model in 2026
+# Most stable model in 2026 for new SDK
 MODEL_NAME = "gemini-2.0-flash"
-model = genai.GenerativeModel(MODEL_NAME) if GEMINI_KEY else None
 
 try:
     from gtts import gTTS
@@ -118,21 +116,18 @@ def ask():
         file_ctx=d.get("file_context","")
         history=d.get("history",[])[:10]
 
-        if not GEMINI_KEY or not model:
+        if not GEMINI_KEY or not client:
             return jsonify({"answer":"GEMINI_API_KEY not set in Render. Go to Render → Environment → Add GEMINI_API_KEY"})
 
-        # IMAGE
         if any(k in q_low for k in ["generate image","create image","draw","picture of","image of","photo of","/image"]):
             prompt=q_raw
             for k in ["generate image of","create image of","generate image","create image","draw","picture of","image of","photo of","/image"]:
                 prompt=prompt.lower().replace(k,"")
             prompt=prompt.strip() or "beautiful Ghanaian culture"
             clean=urllib.parse.quote(prompt)
-            # Free high quality images - no bee
             url=f"https://source.unsplash.com/800x600/?{clean}"
             return jsonify({"answer": f"🎨 Here is your image for: {prompt}", "image_url": url})
 
-        # FILE
         if any(k in q_low for k in ["create pdf","generate pdf","create document","export to pdf"]):
             try:
                 from reportlab.pdfgen import canvas
@@ -153,13 +148,11 @@ def ask():
             except Exception as e:
                 return jsonify({"answer": f"PDF error: {e}"})
 
-        # CHAT WITH GEMINI
-        system_prompt = f"You are MORR AI GH, Ghana's Smart Assistant for Studies, Business & Afro culture. Language: {lang}. Be helpful, friendly, concise. If file context provided, use it. Never say you are text-only. File context: {bool(file_ctx)}"
+        system_prompt = f"You are MORR AI GH, Ghana's Smart Assistant for Studies, Business & Afro culture. Language: {lang}. Be helpful, friendly, concise. If file context provided, use it. File context present: {bool(file_ctx)}"
 
         full_prompt = system_prompt + "\n\n"
         if file_ctx:
             full_prompt += f"FILE: {file_ctx[:4000]}\n\n"
-        # Add history
         for h in history[-6:]:
             if h.get('role')=='user':
                 full_prompt += f"User: {h.get('content')}\n"
@@ -167,7 +160,7 @@ def ask():
                 full_prompt += f"Assistant: {h.get('content')}\n"
         full_prompt += f"User: {q_raw}\nAssistant:"
 
-        resp = model.generate_content(full_prompt)
+        resp = client.models.generate_content(model=MODEL_NAME, contents=full_prompt)
         ans = resp.text if resp.text else "I could not generate a response, try again."
 
         audio_url=None
@@ -194,13 +187,10 @@ def voice():
     f.save(tmp)
     txt=""
     try:
-        if GEMINI_KEY and model:
-            # Gemini can transcribe audio
-            audio_file = genai.upload_file(tmp)
-            resp = model.generate_content(["Transcribe this audio exactly:", audio_file])
+        if client:
+            uploaded = client.files.upload(file=tmp)
+            resp = client.models.generate_content(model=MODEL_NAME, contents=["Transcribe this audio exactly, only return transcription:", uploaded])
             txt = resp.text or ""
-        else:
-            txt=""
     except Exception as e:
         txt=""
     try: os.remove(tmp)
