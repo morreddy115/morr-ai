@@ -13,7 +13,7 @@ if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
 # Use the most stable model in 2026
-MODEL_NAME = "gemini-1.5-flash-latest"
+MODEL_NAME = "gemini-2.0-flash"
 model = genai.GenerativeModel(MODEL_NAME) if GEMINI_KEY else None
 
 try:
