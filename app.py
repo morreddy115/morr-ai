@@ -1,4 +1,5 @@
 import os
+import time
 import tempfile
 import uuid
 import urllib.parse
@@ -11,8 +12,8 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
-# Most stable model in 2026 for new SDK
-MODEL_NAME = "gemini-flash-latest"
+# Updated to a stable, current model version
+MODEL_NAME = "gemini-2.5-flash"
 
 try:
     from gtts import gTTS
@@ -160,8 +161,20 @@ def ask():
                 full_prompt += f"Assistant: {h.get('content')}\n"
         full_prompt += f"User: {q_raw}\nAssistant:"
 
-        resp = client.models.generate_content(model=MODEL_NAME, contents=full_prompt)
-        ans = resp.text if resp.text else "I could not generate a response, try again."
+        # Automatic retry mechanism for temporary high-demand 503 errors
+        resp = None
+        retries = 3
+        for attempt in range(retries):
+            try:
+                resp = client.models.generate_content(model=MODEL_NAME, contents=full_prompt)
+                break
+            except Exception as api_err:
+                if "503" in str(api_err) and attempt < retries - 1:
+                    time.sleep(2)  # Wait 2 seconds before retrying
+                    continue
+                raise api_err
+
+        ans = resp.text if resp and resp.text else "I could not generate a response, try again."
 
         audio_url=None
         try:
