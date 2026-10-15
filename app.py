@@ -1,19 +1,18 @@
 import os
-import time
 import tempfile
 import uuid
 import urllib.parse
+import requests
 from flask import Flask, render_template_string, request, jsonify, send_file
 from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-
-# Updated to a stable, current model version
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-2.5-flash" # stable, but we have fallback if it 503s
 
 try:
     from gtts import gTTS
@@ -23,6 +22,39 @@ except:
 
 GENERATED_DIR = os.path.join(tempfile.gettempdir(), "morr_ai_generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
+
+# ===== NEW: REAL INTERNET SEARCH - NO AI NEEDED =====
+def search_internet(query):
+    """Search real internet without any AI model"""
+    results = ""
+    try:
+        # 1. Try Wikipedia first - free, no key, very stable
+        wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(query)}"
+        r = requests.get(wiki_url, timeout=5, headers={"User-Agent": "MORR AI GH"})
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("extract"):
+                results += f"{data['extract']}\n\nSource: {data.get('content_urls',{}).get('desktop',{}).get('page','')}\n\n"
+
+        # 2. Try DuckDuckGo Instant Answer - free, no key
+        ddg_url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&pretty=1"
+        r2 = requests.get(ddg_url, timeout=5, headers={"User-Agent": "MORR AI GH"})
+        if r2.status_code == 200:
+            data2 = r2.json()
+            if data2.get("AbstractText"):
+                results += f"{data2['AbstractText']}\nSource: {data2.get('AbstractURL','')}\n\n"
+            # Related topics
+            for topic in data2.get("RelatedTopics", [])[:3]:
+                if isinstance(topic, dict) and topic.get("Text"):
+                    results += f"- {topic['Text']}\n"
+
+        if not results:
+            results = f"I searched the internet for '{query}' but couldn't get a direct summary. Try a more specific query like '{query} wikipedia' or check your internet connection."
+
+    except Exception as e:
+        results = f"Internet search failed: {str(e)[:200]}. But here's a general answer: {query} is a topic that can be researched online."
+
+    return results[:4000]
 
 HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH</title>
 <style>
@@ -43,7 +75,7 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 .msg img{max-width:100%;border-radius:12px;margin-top:10px}
 .msg a{color:#FFD700}
 </style></head><body>
-<div class="header"><h1>MORR AI GH <img src="https://flagcdn.com/w20/gh.png" style="width:24px;height:18px;border-radius:3px"></h1><div class="sub">Smart AI - Chat - Images - Files - Powered by Gemini</div></div>
+<div class="header"><h1>MORR AI GH <img src="https://flagcdn.com/w20/gh.png" style="width:24px;height:18px;border-radius:3px"></h1><div class="sub">Smart AI - Chat - Images - Files - Now with Real Internet Search</div></div>
 <div id="chat"></div>
 <div class="input-area"><div id="status" style="color:#FFD700;font-size:12px"></div>
 <div class="row"><select id="lang"><option>English</option><option>Pidgin</option><option>Twi</option><option>Hausa</option></select>
@@ -55,7 +87,7 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 let chatHistory=[];let uploadedText="";let recorder,chunks=[],recording=false;
 function addMsg(r,t,h=false){let c=document.getElementById('chat');let d=document.createElement('div');d.className='msg '+r;if(!t)t="...";if(h)d.innerHTML=t;else d.textContent=t;c.appendChild(d);c.scrollTop=c.scrollHeight;}
 async function sendText(){
- let i=document.getElementById('q');let q=i.value.trim();if(!q&&!uploadedText)return;if(q)addMsg('user',q);i.value='';document.getElementById('status').innerText="MORR dey think...";
+ let i=document.getElementById('q');let q=i.value.trim();if(!q&&!uploadedText)return;if(q)addMsg('user',q);i.value='';document.getElementById('status').innerText="MORR dey search internet...";
  try{
   let res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,file_context:uploadedText,language:document.getElementById('lang').value,history:chatHistory})});
   let data=await res.json();document.getElementById('status').innerText='';
@@ -75,7 +107,7 @@ async function toggleMic(){
  }catch(e){document.getElementById('status').innerText='Mic error: '+e.message;}
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
-addMsg('ai',"Akwaaba! I am MORR AI GH 🇬🇭<br>Now powered by Gemini — faster & stable<br>Chat, images, files and voice — what do you want to do today?",true);
+addMsg('ai',"Akwaaba! I am MORR AI GH 🇬🇭<br>Now with REAL internet search - no more 503!<br>Ask me anything, I will search Wikipedia & web live.",true);
 </script></body></html>"""
 
 @app.route("/")
@@ -117,68 +149,76 @@ def ask():
         file_ctx=d.get("file_context","")
         history=d.get("history",[])[:10]
 
-        if not GEMINI_KEY or not client:
-            return jsonify({"answer":"GEMINI_API_KEY not set in Render. Go to Render → Environment → Add GEMINI_API_KEY"})
-
-        if any(k in q_low for k in ["generate image","create image","draw","picture of","image of","photo of","/image"]):
+        # ===== IMAGE - NO AI KEY NEEDED - REAL INTERNET GENERATION =====
+        if any(k in q_low for k in ["generate image","create image","generate a picture","draw","picture of","image of","photo of","/image"]):
             prompt=q_raw
-            for k in ["generate image of","create image of","generate image","create image","draw","picture of","image of","photo of","/image"]:
+            for k in ["generate image of","create image of","generate a picture of","generate a image of","generate image","create image","generate a","generate","draw","picture of","image of","photo of","/image"]:
                 prompt=prompt.lower().replace(k,"")
             prompt=prompt.strip() or "beautiful Ghanaian culture"
-            clean=urllib.parse.quote(prompt)
-            url=f"https://source.unsplash.com/800x600/?{clean}"
-            return jsonify({"answer": f"🎨 Here is your image for: {prompt}", "image_url": url})
+            clean=urllib.parse.quote_plus(prompt)
+            url=f"https://image.pollinations.ai/prompt/{clean}?width=800&height=600&nologo=true&enhance=true"
+            return jsonify({"answer": f"🎨 Here is your AI image for: {prompt}\nGenerated from internet (Pollinations AI) - No Gemini needed!", "image_url": url})
 
+        # ===== FILE GENERATION - NO AI NEEDED =====
         if any(k in q_low for k in ["create pdf","generate pdf","create document","export to pdf"]):
             try:
                 from reportlab.pdfgen import canvas
                 fname=f"morr_{uuid.uuid4().hex[:8]}.pdf"
                 fpath=os.path.join(GENERATED_DIR, fname)
+                # Get real info from internet for the PDF
+                web_info = search_internet(q_raw[:100])
                 c=canvas.Canvas(fpath)
                 c.setFont("Helvetica-Bold",16)
-                c.drawString(80,750,"MORR AI GH - Document")
+                c.drawString(80,750,"MORR AI GH - Document (From Internet)")
                 c.setFont("Helvetica",11)
                 c.drawString(80,720,f"Topic: {q_raw[:120]}")
                 y=680
-                for line in q_raw.split(".")[:20]:
-                    c.drawString(80,y,line[:90])
-                    y-=18
+                c.setFont("Helvetica",10)
+                for line in web_info.split("\n")[:30]:
+                    c.drawString(60,y,line[:95])
+                    y-=14
                     if y<50: break
                 c.save()
-                return jsonify({"answer":f"📄 Created PDF for: {q_raw}", "file_url": f"/download/{fname}"})
+                return jsonify({"answer":f"📄 Created PDF from REAL internet data for: {q_raw}", "file_url": f"/download/{fname}"})
             except Exception as e:
                 return jsonify({"answer": f"PDF error: {e}"})
 
-        system_prompt = f"You are MORR AI GH, Ghana's Smart Assistant for Studies, Business & Afro culture. Language: {lang}. Be helpful, friendly, concise. If file context provided, use it. File context present: {bool(file_ctx)}"
+        # ===== CHAT: TRY GEMINI, IF FAILS USE REAL INTERNET SEARCH =====
+        ans = None
+        try:
+            if client:
+                system_prompt = f"You are MORR AI GH, Ghana's Smart Assistant. Language: {lang}. Be helpful, concise. File context: {file_ctx[:200] if file_ctx else 'none'}"
+                full_prompt = system_prompt + "\n\n"
+                if file_ctx:
+                    full_prompt += f"FILE: {file_ctx[:3000]}\n\n"
+                for h in history[-4:]:
+                    if h.get('role')=='user':
+                        full_prompt += f"User: {h.get('content')}\n"
+                full_prompt += f"User: {q_raw}\nAssistant:"
 
-        full_prompt = system_prompt + "\n\n"
-        if file_ctx:
-            full_prompt += f"FILE: {file_ctx[:4000]}\n\n"
-        for h in history[-6:]:
-            if h.get('role')=='user':
-                full_prompt += f"User: {h.get('content')}\n"
-            else:
-                full_prompt += f"Assistant: {h.get('content')}\n"
-        full_prompt += f"User: {q_raw}\nAssistant:"
+                resp = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())]
+                    )
+                )
+                ans = resp.text
+        except Exception as e:
+            # Gemini failed with 503 or other - fallback to internet
+            print(f"Gemini failed, using internet fallback: {e}")
+            ans = None
 
-        # Automatic retry mechanism for temporary high-demand 503 errors
-        resp = None
-        retries = 3
-        for attempt in range(retries):
-            try:
-                resp = client.models.generate_content(model=MODEL_NAME, contents=full_prompt)
-                break
-            except Exception as api_err:
-                if "503" in str(api_err) and attempt < retries - 1:
-                    time.sleep(2)  # Wait 2 seconds before retrying
-                    continue
-                raise api_err
-
-        ans = resp.text if resp and resp.text else "I could not generate a response, try again."
+        # FALLBACK: REAL INTERNET SEARCH - NO AI AT ALL
+        if not ans:
+            web_result = search_internet(q_raw)
+            ans = f"🌐 **MORR AI GH - Live Internet Result (No AI model used):**\n\n{web_result}\n\n*This was fetched directly from Wikipedia & DuckDuckGo, not from any AI model's training data.*"
+            if file_ctx:
+                ans += f"\n\nUsing your file: {file_ctx[:500]}"
 
         audio_url=None
         try:
-            if HAS_GTTS:
+            if HAS_GTTS and ans:
                 fname_a=f"morr_{uuid.uuid4().hex[:6]}.mp3"
                 fpath_a=os.path.join(GENERATED_DIR, fname_a)
                 gTTS(text=ans[:350], lang='en').save(fpath_a)
@@ -204,7 +244,7 @@ def voice():
             uploaded = client.files.upload(file=tmp)
             resp = client.models.generate_content(model=MODEL_NAME, contents=["Transcribe this audio exactly, only return transcription:", uploaded])
             txt = resp.text or ""
-    except Exception as e:
+    except:
         txt=""
     try: os.remove(tmp)
     except: pass
