@@ -7,3 +7,5 @@ PyPDF2
 python-docx
 reportlab
 Pillow
+requests
+beautifulsoup4
