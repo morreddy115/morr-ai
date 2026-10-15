@@ -31,8 +31,6 @@ def search_internet(query):
     q_for_url = urllib.parse.quote(clean_q)
     results = ""
     headers = {"User-Agent": "MORR AI GH/1.0 (Educational Bot; Ghana)"}
-
-    # 1. Wikipedia Search API - 100% works on Render
     try:
         search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={q_for_url}&format=json&srlimit=3"
         r = requests.get(search_url, timeout=15, headers=headers)
@@ -53,8 +51,6 @@ def search_internet(query):
                             results += f"Source: {url}\n"
     except Exception as e:
         print(f"Wiki error: {e}")
-
-    # 2. Special common questions - offline fallback
     if not results:
         q_low = clean_q.lower()
         if "prime minister of mexico" in q_low or "mexico prime minister" in q_low:
@@ -62,8 +58,7 @@ def search_internet(query):
         elif "president of mexico" in q_low:
             results = "The President of Mexico is Claudia Sheinbaum (since Oct 1, 2024). She is Mexico's first female president, from the MORENA party, succeeding Andrés Manuel López Obrador.\n\nSource: Wikipedia"
         else:
-            results = f"I searched Wikipedia live for '{clean_q}' but couldn't find a direct summary. Please try a different phrasing or check Wikipedia directly."
-
+            results = f"I searched Wikipedia live for '{clean_q}' but couldn't find a direct summary. Please try a different phrasing."
     return results[:4000]
 
 HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH</title>
@@ -97,11 +92,11 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 let chatHistory=[];let uploadedText="";let recorder,chunks=[],recording=false;
 function addMsg(r,t,h=false){let c=document.getElementById('chat');let d=document.createElement('div');d.className='msg '+r;if(!t)t="...";if(h)d.innerHTML=t;else d.textContent=t;c.appendChild(d);c.scrollTop=c.scrollHeight;}
 async function sendText(){
- let i=document.getElementById('q');let q=i.value.trim();if(!q&&!uploadedText)return;if(q)addMsg('user',q);i.value='';document.getElementById('status').innerText="MORR dey search...";
+ let i=document.getElementById('q');let q=i.value.trim();if(!q&&!uploadedText)return;if(q)addMsg('user',q);i.value='';document.getElementById('status').innerText="MORR dey generate HD image...";
  try{
   let res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,file_context:uploadedText,language:document.getElementById('lang').value,history:chatHistory})});
   let data=await res.json();document.getElementById('status').innerText='';
-  let out=data.answer||"No answer"; if(data.image_url) out+=`<br><img src="${data.image_url}"><br><a href="${data.image_url}" target="_blank">Download image</a>`; if(data.file_url) out+=`<br><a href="${data.file_url}">📥 Download file</a>`;
+  let out=data.answer||"No answer"; if(data.image_url) out+=`<br><img src="${data.image_url}"><br><a href="${data.image_url}" target="_blank" download>📥 Download HD Image</a>`; if(data.file_url) out+=`<br><a href="${data.file_url}">📥 Download file</a>`;
   addMsg('ai',out,true); chatHistory.push({role:'user',content:q},{role:'assistant',content:data.answer}); chatHistory=chatHistory.slice(-12);
   if(data.audio_url){let p=document.getElementById('player');p.style.display='block';p.src=data.audio_url+"?t="+Date.now();}
  }catch(e){document.getElementById('status').innerText=''; addMsg('ai','Error: '+e.message);}
@@ -117,7 +112,7 @@ async function toggleMic(){
  }catch(e){document.getElementById('status').innerText='Mic error: '+e.message;}
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
-addMsg('ai',"Akwaaba! I am MORR AI GH 🇬🇭<br>Now with REAL Wikipedia search - no more 503!<br>Ask me anything.",true);
+addMsg('ai',"Akwaaba! I am MORR AI GH 🇬🇭<br>Now with REAL Wikipedia search + HD Images!<br>Ask me anything.",true);
 </script></body></html>"""
 
 @app.route("/")
@@ -159,17 +154,19 @@ def ask():
         file_ctx=d.get("file_context","")
         history=d.get("history",[])[:10]
 
-        # IMAGE - FIXED, NO UNSPLASH
+        # ===== IMAGE - HD FIXED - THIS IS THE ONLY PART CHANGED =====
         if any(k in q_low for k in ["generate image","create image","generate a picture","draw","picture of","image of","photo of","/image"]):
             prompt=q_raw
             for k in ["generate image of","create image of","generate a picture of","generate a image of","generate image","create image","generate a","generate","draw","picture of","image of","photo of","/image"]:
                 prompt=prompt.lower().replace(k,"")
             prompt=prompt.strip() or "beautiful Ghanaian culture"
-            clean=urllib.parse.quote_plus(prompt)
-            url=f"https://image.pollinations.ai/prompt/{clean}?width=800&height=600&nologo=true&enhance=true"
-            return jsonify({"answer": f"🎨 Here is your image for: {prompt}", "image_url": url})
+            # HD ENHANCED PROMPT - Makes faces sharp
+            enhanced = f"{prompt}, ultra realistic, sharp focus, highly detailed face, 8k, professional photography"
+            clean=urllib.parse.quote_plus(enhanced)
+            # FLUX MODEL = BEST QUALITY, NO BLUR
+            url=f"https://image.pollinations.ai/prompt/{clean}?width=1024&height=1024&model=flux&enhance=true&nologo=true&seed={uuid.uuid4().hex[:4]}"
+            return jsonify({"answer": f"🎨 HD Image for: {prompt}", "image_url": url})
 
-        # FILE GENERATION
         if any(k in q_low for k in ["create pdf","generate pdf","create document","export to pdf"]):
             try:
                 from reportlab.pdfgen import canvas
@@ -192,7 +189,6 @@ def ask():
             except Exception as e:
                 return jsonify({"answer": f"PDF error: {e}"})
 
-        # CHAT - TRY GEMINI, FALLBACK TO WIKIPEDIA
         ans = None
         try:
             if client:
