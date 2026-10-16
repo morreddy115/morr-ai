@@ -1,435 +1,216 @@
 import os
+import sqlite3
 import tempfile
 import uuid
-import urllib.parse
 import requests
-from flask import Flask, render_template_string, request, jsonify, send_file
-from google import genai
-from google.genai import types
+import json
+from flask import Flask, render_template_string, request, jsonify, session, redirect, send_file
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "morr-gh-2026-final-v3")
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
-
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-MODEL_NAME = "gemini-2.5-flash"
-
-try:
-    from gtts import gTTS
-    HAS_GTTS = True
-except:
-    HAS_GTTS = False
-
 GENERATED_DIR = os.path.join(tempfile.gettempdir(), "morr_ai_generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
 
-# ===== SMART MEMORY RESOLVER =====
-def resolve_context(query, history):
-    q_low = query.lower().strip()
-    if any(p in q_low for p in ["his wife", "her husband", "his husband", "who is his", "who is her", "his children", "her children", "his wife name", "picture of him", "image of him", "photo of him", "him swearing"]):
-        for h in reversed(history):
-            c = h.get('content','')
-            if not c: continue
-            if 'John Dramani Mahama' in c or 'John Mahama' in c:
-                if 'wife' in q_low: return "Lordina Mahama wife of John Mahama"
-                if 'children' in q_low: return "John Mahama children"
-                return "John Dramani Mahama"
-            if 'Claudia Sheinbaum' in c:
-                return "Claudia Sheinbaum"
-            if 'Kwame Nkrumah' in c:
-                return "Kwame Nkrumah"
-            if 'President of Ghana' in c:
-                return "John Dramani Mahama President of Ghana"
-        if q_low in ["who is his wife", "who is her husband"]:
-            return "John Dramani Mahama wife Lordina Mahama"
-    return query
+# --- DB ---
+def init_db():
+    conn = sqlite3.connect('morr.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, password TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT, q TEXT, a TEXT, created TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+init_db()
 
-# ===== REAL WIKIPEDIA SEARCH + REAL IMAGE =====
-def get_wikipedia_real(query):
-    clean_q = query.strip()
-    if not clean_q:
-        return {"text":"Please ask a question.", "image":None, "url":None, "title":None}
-    headers = {"User-Agent": "MORR AI GH/1.0 (Educational Bot; Ghana)"}
-    result = {"text":"", "image":None, "url":None, "title":None}
+# --- INTERNET SEARCH: WHOLE INTERNET (Not Wikipedia only) ---
+def search_whole_internet(query):
+    """Searches entire web via DuckDuckGo - no API key needed"""
+    results_text = ""
+    images = []
+    sources = []
     try:
-        search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(clean_q)}&format=json&srlimit=1"
-        r = requests.get(search_url, timeout=12, headers=headers)
-        if r.status_code == 200:
-            data = r.json()
-            hits = data.get("query", {}).get("search", [])
-            if hits:
-                title = hits[0].get("title", "")
-                result["title"] = title
-                summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
-                r2 = requests.get(summary_url, timeout=12, headers=headers)
-                if r2.status_code == 200:
-                    j = r2.json()
-                    result["text"] = j.get("extract", "")
-                    result["url"] = j.get("content_urls", {}).get("desktop", {}).get("page", "")
-                    if j.get("originalimage"):
-                        result["image"] = j.get("originalimage", {}).get("source")
-                    elif j.get("thumbnail"):
-                        result["image"] = j.get("thumbnail", {}).get("source")
-                if not result["image"]:
-                    img_url = f"https://en.wikipedia.org/w/api.php?action=query&titles={urllib.parse.quote(title)}&prop=pageimages&format=json&pithumbsize=800"
-                    r3 = requests.get(img_url, timeout=12, headers=headers)
-                    if r3.status_code == 200:
-                        pages = r3.json().get("query", {}).get("pages", {})
-                        for p in pages.values():
-                            if p.get("thumbnail"):
-                                result["image"] = p.get("thumbnail", {}).get("source")
-                                break
+        # Try duckduckgo-search library
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+            for r in results:
+                results_text += f"\nTitle: {r.get('title')}\nSnippet: {r.get('body')}\nSource: {r.get('href')}\n"
+                sources.append(r.get('href'))
     except Exception as e:
-        print(f"Wiki real error: {e}")
-    if not result["text"]:
-        low = clean_q.lower()
-        if "lordina" in low or "mahama wife" in low:
-            result["text"] = "Lordina Mahama is the First Lady of Ghana since 7 January 2025 (also 2012-2017). Married to John Mahama in 1992, 5 children: Shafik, Shahid, Sharaf, Jesse and Farida. Met at Ghana Secondary School, Tamale. Degree in Hospitality Management from GIMPA."
-            result["image"] = "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6a/Lordina_Mahama.jpg/440px-Lordina_Mahama.jpg"
-            result["url"] = "https://en.wikipedia.org/wiki/Lordina_Mahama"
-            result["title"] = "Lordina Mahama"
-        elif "john mahama" in low or "president of ghana" in low:
-            result["text"] = "John Dramani Mahama is the 14th President of Ghana since 7 January 2025. He previously served 2012-2017. He won the 2024 election with 56.42% against Mahamudu Bawumia (41.75%). He is a member of NDC."
-            result["image"] = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4d/John_Dramani_Mahama.jpg/440px-John_Dramani_Mahama.jpg"
-            result["url"] = "https://en.wikipedia.org/wiki/John_Dramani_Mahama"
-            result["title"] = "John Dramani Mahama"
-    return result
+        print(f"DDGS error: {e}")
+        # Fallback to Wikipedia if DDGS not available
+        try:
+            r = requests.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(query)}", timeout=8, headers={"User-Agent":"MORR AI GH"})
+            if r.status_code==200:
+                j=r.json()
+                results_text = j.get("extract","")
+                if j.get("originalimage"):
+                    images.append(j["originalimage"]["source"])
+                sources.append(j.get("content_urls",{}).get("desktop",{}).get("page"))
+        except:
+            pass
+    return {"text": results_text[:6000], "images": images, "sources": sources}
 
-HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI - Real Wiki</title>
+# --- SMART BRAIN: Groq (FREE) + Gemini Backup ---
+def ask_smart_brain(question, internet_context, history_text, lang):
+    GROQ_KEY = os.getenv("GROQ_API_KEY")
+    GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
+    system_prompt = f"""You are MORR AI GH, Ghana's smartest AI, built by Morr.
+You are like Meta AI, ChatGPT, friendly, witty, proudly Ghanaian. Language: {lang}.
+You have LIVE internet context below. Use it to answer accurately.
+- If user says "how are you doing" -> say "Chale I'm good oo! How for you? How I fit help you today?" NOT song definition.
+- If President of Gabon -> Brice Oligui Nguema (took over Aug 2023, elected 2025)
+- If Jamaica President -> Explain Jamaica has NO President, it has Prime Minister Andrew Holness and King Charles as head of state.
+- Keep answers short, helpful, human, Ghana vibe when needed.
+- If internet context has info, cite it.
+"""
+
+    full_prompt = f"{system_prompt}\n\nINTERNET LIVE RESULTS:\n{internet_context}\n\nCHAT HISTORY:\n{history_text}\n\nUSER QUESTION: {question}\n\nAnswer:"
+
+    # 1. Try GROQ (FREE, STABLE, Llama - same tech as Meta AI)
+    if GROQ_KEY:
+        try:
+            from groq import Groq
+            client = Groq(api_key=GROQ_KEY)
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role":"user","content": full_prompt}],
+                temperature=0.7,
+                max_tokens=800
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            print(f"Groq failed: {e}")
+
+    # 2. Try Gemini as backup
+    if GEMINI_KEY:
+        try:
+            from google import genai
+            from google.genai import types
+            gclient = genai.Client(api_key=GEMINI_KEY)
+            resp = gclient.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=full_prompt,
+                config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())])
+            )
+            return resp.text
+        except Exception as e:
+            print(f"Gemini failed: {e}")
+
+    # 3. FINAL FALLBACK: No API key at all - answer from internet context itself
+    if internet_context:
+        return f"Based on live internet search for '{question}':\n\n{internet_context[:1000]}\n\n(Note: Add GROQ_API_KEY in Render for smarter replies)"
+    return "Chale, I'm having small network issue, but I'm here! Try ask again — How I fit help you?"
+
+HTML = """
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - V3</title>
 <style>
-body{background:#0a0a0a;color:white;font-family:system-ui;margin:0;padding:0;display:flex;flex-direction:column;height:100vh}
-.header{padding:14px;text-align:center;border-bottom:1px solid #222}
-h1{color:#FFD700;font-size:28px;margin:0}
-.sub{color:#aaa;font-size:12px;margin-top:4px}
-#chat{flex:1;overflow-y:auto;padding:16px;max-width:900px;width:100%;margin:0 auto;box-sizing:border-box}
-.msg{padding:14px 18px;border-radius:18px;margin:10px 0;max-width:88%;line-height:1.7;word-wrap:break-word;font-size:14.5px;white-space:pre-wrap}
-.user{background:#FFD700;color:black;margin-left:auto;border-bottom-right-radius:4px}
-.ai{background:#1e1e1e;border:1px solid #333;border-bottom-left-radius:4px}
-.input-area{border-top:1px solid #222;padding:12px;background:#0a0a0a;max-width:900px;margin:0 auto;width:100%;box-sizing:border-box}
-.row{display:flex;gap:8px;align-items:center}
-select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:none}
-#q{flex:1;padding:14px;border-radius:12px;border:none;background:#1e1e1e;color:white;font-size:16px;min-width:0}
-.btn{padding:12px 16px;background:#FFD700;color:black;border:none;border-radius:12px;font-weight:bold;cursor:pointer}
-.btn2{background:#333;color:white}
-.msg img{max-width:100%;border-radius:12px;margin-top:10px;display:block}
-.msg a{color:#FFD700}
-.badge{display:inline-block;background:#333;color:#FFD700;padding:2px 8px;border-radius:8px;font-size:11px;margin-bottom:6px}
+body{margin:0;display:flex;height:100vh;font-family:system-ui;background:#0a0a0a;color:white}
+#sidebar{width:270px;background:#171717;padding:15px;overflow-y:auto;border-right:1px solid #222;display:flex;flex-direction:column}
+#main{flex:1;display:flex;flex-direction:column;max-width:100%}
+#chat{flex:1;overflow-y:auto;padding:20px;max-width:900px;width:100%;margin:0 auto;box-sizing:border-box}
+.msg{padding:14px 18px;border-radius:18px;margin:10px 0;max-width:90%;line-height:1.6;font-size:14.5px;white-space:pre-wrap;word-wrap:break-word}
+.user{background:#FFD700;color:black;margin-left:auto}
+.ai{background:#1e1e1e;border:1px solid #333}
+.input-area{border-top:1px solid #222;padding:12px;background:#0a0a0a}
+.row{display:flex;gap:8px;max-width:900px;margin:0 auto;width:100%}
+#q{flex:1;padding:14px;border-radius:12px;border:none;background:#1e1e1e;color:white;font-size:16px}
+.btn{padding:12px 18px;background:#FFD700;color:black;border:none;border-radius:12px;font-weight:bold;cursor:pointer}
+.hist{padding:8px 10px;border-radius:8px;cursor:pointer;color:#aaa;font-size:13px;margin:4px 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist:hover{background:#222;color:white}
+.small{font-size:11px;color:#666}
+a{color:#FFD700}
 </style></head><body>
-<div class="header"><h1>MORR AI GH <img src="https://flagcdn.com/w20/gh.png" style="width:20px;border-radius:3px"></h1><div class="sub">Real Wikipedia Photos • Smart Memory • File & Image Reader • Like Meta AI / GPT</div></div>
-<div id="chat"></div>
-<div class="input-area"><div id="status" style="color:#FFD700;font-size:12px"></div>
-<div class="row"><select id="lang"><option>English</option><option>Pidgin</option><option>Twi</option><option>Hausa</option></select>
-<input type="file" id="fileInput" hidden onchange="handleFile()" accept=".pdf,.docx,.txt,.csv,.json,.py,.js,.html,.md,.jpg,.jpeg,.png,.webp"><button class="btn btn2" onclick="document.getElementById('fileInput').click()">📎</button>
-<input id="q" placeholder="Ask, upload image to analyze, or 'generate image of Kwame Nkrumah'"><button class="btn" onclick="sendText()">➤</button>
-<button class="btn btn2" id="micBtn" onclick="toggleMic()">🎤</button></div>
-<audio id="player" controls style="display:none;width:100%;margin-top:8px"></audio></div>
+<div id="sidebar">
+<h3 style="color:#FFD700;margin:0">MORR AI GH <span style="font-size:12px;background:#FFD700;color:black;padding:2px 6px;border-radius:6px">V3</span></h3>
+<div class="small">Whole Internet + Llama Brain</div>
+{% if user_email %}
+<div style="margin:12px 0;padding:8px;background:#222;border-radius:8px;font-size:13px">{{ user_email }}<br><a href="/logout">Logout</a></div>
+{% else %}
+<a href="/login" style="display:block;margin:12px 0;padding:10px;background:white;color:black;text-align:center;border-radius:8px;font-weight:bold;text-decoration:none">Login / Create Account</a>
+{% endif %}
+<hr style="border-color:#222;width:100%">
+<button onclick="localStorage.clear();location.reload()" style="background:#222;color:#aaa;border:none;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:12px">+ New Chat</button>
+<div style="margin-top:12px" id="histList"></div>
+</div>
+<div id="main">
+<div id="chat"><div class="msg ai">Akwaaba! I am MORR AI V3 🇬🇭\nNow I search the WHOLE internet (not just Wikipedia) and I use Llama brain like Meta AI.\nTry: "President of Gabon", "How are you doing", "President of Jamaica"\nHow I fit help you today?</div></div>
+<div class="input-area"><div class="row">
+<input id="q" placeholder="Ask anything... Twi, Pidgin, English"><button class="btn" onclick="send()">➤</button>
+</div><div id="status" style="max-width:900px;margin:5px auto;color:#FFD700;font-size:12px"></div></div>
+</div>
 <script>
-let chatHistory=[];let uploadedText="";let uploadedImageDesc="";let recorder,chunks=[],recording=false;
-function addMsg(r,t,h=false){let c=document.getElementById('chat');let d=document.createElement('div');d.className='msg '+r;if(!t)t="...";if(h)d.innerHTML=t;else d.textContent=t;c.appendChild(d);c.scrollTop=c.scrollHeight;}
-async function sendText(){
- let i=document.getElementById('q');let q=i.value.trim();if(!q&&!uploadedText&&!uploadedImageDesc)return;if(q)addMsg('user',q);i.value='';document.getElementById('status').innerText="MORR dey search real Wikipedia...";
+let history = JSON.parse(localStorage.getItem('morr_v3_hist')||'[]');
+function renderHist(){
+ const d=document.getElementById('histList');
+ d.innerHTML='<div class="small">Recent Commands</div>'+history.slice().reverse().slice(0,20).map(h=>`<div class="hist" onclick="document.getElementById('q').value='${h.q.replace(/'/g,'')}';">${h.q.substring(0,35)}</div>`).join('');
+}
+renderHist();
+async function send(){
+ let q=document.getElementById('q').value.trim(); if(!q) return;
+ document.getElementById('q').value='';
+ let chat=document.getElementById('chat');
+ chat.innerHTML+=`<div class="msg user">${q}</div>`;
+ history.push({q}); localStorage.setItem('morr_v3_hist', JSON.stringify(history)); renderHist();
+ document.getElementById('status').innerText='MORR dey search whole internet + thinking...';
  try{
-  let body={question:q,file_context:uploadedText, image_context: uploadedImageDesc, language:document.getElementById('lang').value, history:chatHistory};
-  let res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  let data=await res.json();document.getElementById('status').innerText='';
-  let out=""; if(data.badge) out+=`<span class='badge'>${data.badge}</span><br>`; out+=data.answer||"No answer";
-  if(data.image_url) out+=`<br><img src="${data.image_url}"><br><a href="${data.image_url}" target="_blank">📥 Download Real Image</a>`;
-  if(data.file_url) out+=`<br><a href="${data.file_url}">📥 Download File</a>`;
-  if(data.source_url) out+=`<br><small><a href="${data.source_url}" target="_blank">🔗 Source: ${data.source_url}</a></small>`;
-  addMsg('ai',out,true); chatHistory.push({role:'user',content:q},{role:'assistant',content:data.answer}); chatHistory=chatHistory.slice(-14);
-  if(data.audio_url){let p=document.getElementById('player');p.style.display='block';p.src=data.audio_url+"?t="+Date.now();}
- }catch(e){document.getElementById('status').innerText=''; addMsg('ai','Error: '+e.message);}
- uploadedText=''; uploadedImageDesc=''; document.getElementById('fileInput').value='';
+  let res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+  let data=await res.json();
+  let html=data.answer.replace(/</g,'&lt;').replace(/\\n/g,'<br>');
+  if(data.sources && data.sources.length){ html+=`<br><br><small>Sources: ${data.sources.slice(0,2).map(s=>`<a href="${s}" target="_blank">${s.substring(0,30)}...</a>`).join(' | ')}</small>`; }
+  chat.innerHTML+=`<div class="msg ai">${html}</div>`;
+ }catch(e){ chat.innerHTML+=`<div class="msg ai">Error: ${e.message}</div>`; }
+ document.getElementById('status').innerText=''; chat.scrollTop=chat.scrollHeight;
 }
-async function handleFile(){
- let f=document.getElementById('fileInput').files[0];if(!f)return;
- document.getElementById('status').innerText='📄 Analyzing '+f.name+'...';
- let fd=new FormData();fd.append('file',f);
- let res=await fetch('/upload',{method:'POST',body:fd});let data=await res.json();
- uploadedText=data.text||''; uploadedImageDesc=data.image_desc||'';
- document.getElementById('status').innerText='✅ '+f.name+' understood: '+(uploadedImageDesc||uploadedText||'ready').substring(0,80);
- if(data.preview){addMsg('user','[Uploaded: '+f.name+']<br><img src="'+data.preview+'">',true);}
-}
-async function toggleMic(){
- let btn=document.getElementById('micBtn');
- try{
-  if(!recording){let s=await navigator.mediaDevices.getUserMedia({audio:true}); recorder=new MediaRecorder(s); chunks=[]; recorder.ondataavailable=e=>chunks.push(e.data);
-   recorder.onstop=async()=>{let blob=new Blob(chunks,{type:'audio/webm'});let fd=new FormData();fd.append('audio',blob,'voice.webm');fd.append('language',document.getElementById('lang').value);document.getElementById('status').innerText='Transcribing...';let res=await fetch('/voice',{method:'POST',body:fd});let d=await res.json();if(d.text){document.getElementById('q').value=d.text;sendText();}else{document.getElementById('status').innerText='Could not transcribe';} s.getTracks().forEach(t=>t.stop());}; recorder.start(); recording=true; btn.innerText='🔴';
-  }else{recorder.stop(); recording=false; btn.innerText='🎤';}
- }catch(e){document.getElementById('status').innerText='Mic error: '+e.message;}
-}
-document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
-addMsg('ai',"Akwaaba! I am MORR AI 🇬🇭<br>I Operates In English, Pidgin, Twi & Hausa<br>How May I Help You Today?",true);
-</script></body></html>"""
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')send()});
+</script></body></html>
+"""
+
+LOGIN_HTML = """<div style="background:#0a0a0a;color:white;height:100vh;display:flex;align-items:center;justify-content:center;font-family:system-ui"><div style="background:#171717;padding:30px;border-radius:15px;width:320px;border:1px solid #333"><h2 style="color:#FFD700">MORR AI GH V3</h2><form method="POST"><input name="email" placeholder="Email" required style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:white"><input name="password" type="password" placeholder="Password" required style="width:100%;padding:12px;margin:8px 0;border-radius:8px;border:1px solid #333;background:#222;color:white"><button style="width:100%;padding:12px;border-radius:8px;border:none;background:#FFD700;color:black;font-weight:bold;margin-top:10px">Login / Create Account</button></form><p style="font-size:11px;color:#888;margin-top:12px">If email new, we create account. If exists, we login.</p><a href="/" style="color:#666;font-size:12px">Back to chat</a></div></div>"""
 
 @app.route("/")
 def home():
-    return render_template_string(HTML)
+    return render_template_string(HTML, user_email=session.get("email"))
 
-@app.route("/upload", methods=["POST"])
-def upload():
-    f = request.files.get('file')
-    if not f: return jsonify({"text":"", "image_desc":"", "preview":None}),400
-    name = f.filename.lower()
-    tmp_path = os.path.join(tempfile.gettempdir(), f.filename)
-    f.save(tmp_path)
-    text = ""
-    image_desc = ""
-    preview_url = None
-    is_image = name.endswith(('.jpg','.jpeg','.png','.webp','.bmp'))
-    try:
-        if is_image:
-            preview_name = f"prev_{uuid.uuid4().hex[:8]}_{os.path.basename(tmp_path)}"
-            preview_path = os.path.join(GENERATED_DIR, preview_name)
-            from PIL import Image
-            try:
-                im = Image.open(tmp_path)
-                im.thumbnail((800,800))
-                im.save(preview_path)
-                preview_url = f"/download/{preview_name}"
-            except:
-                preview_url = None
-            if client:
-                try:
-                    uploaded = client.files.upload(file=tmp_path)
-                    resp = client.models.generate_content(
-                        model=MODEL_NAME,
-                        contents=["Describe this image in detail. Who or what is in it? Read any text. If it's a person, who is it? This description will be used to answer user questions.", uploaded]
-                    )
-                    image_desc = resp.text or ""
-                    text = f"[IMAGE UPLOADED: {f.filename}]\nVision Analysis: {image_desc}"
-                except Exception as e:
-                    image_desc = f"Image uploaded: {f.filename} (vision analysis failed: {e})"
-                    text = image_desc
-            else:
-                image_desc = f"Image uploaded: {f.filename}. I can see it's an image file."
-                text = image_desc
-        elif name.endswith('.pdf'):
-            import PyPDF2
-            r = PyPDF2.PdfReader(tmp_path)
-            text = " ".join([(p.extract_text() or "") for p in r.pages[:10]])[:10000]
-        elif name.endswith(('.txt','.csv','.py','.js','.html','.json','.md')):
-            with open(tmp_path,'r',errors='ignore') as file: text=file.read()[:10000]
-        elif name.endswith('.docx'):
-            import docx
-            doc = docx.Document(tmp_path)
-            text = " ".join([p.text for p in doc.paragraphs])[:10000]
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method=="POST":
+        email=request.form["email"].lower().strip()
+        password=request.form["password"]
+        conn=sqlite3.connect('morr.db'); c=conn.cursor()
+        c.execute("SELECT id,password FROM users WHERE email=?", (email,)); row=c.fetchone()
+        if row and check_password_hash(row[1], password):
+            session["user_id"]=row[0]; session["email"]=email; conn.close(); return redirect("/")
+        elif row:
+            conn.close(); return "Wrong password <a href='/login'>Back</a>"
         else:
-            text=f"[File {f.filename} uploaded - type not fully supported but noted]"
-    except Exception as e:
-        text = f"[File {f.filename} read error: {e}]"
-    return jsonify({"text":text, "image_desc":image_desc, "preview":preview_url})
+            hashed=generate_password_hash(password)
+            c.execute("INSERT INTO users (email,password) VALUES (?,?)", (email,hashed)); conn.commit()
+            session["user_id"]=c.lastrowid; session["email"]=email; conn.close(); return redirect("/")
+    return render_template_string(LOGIN_HTML)
+
+@app.route("/logout")
+def logout():
+    session.clear(); return redirect("/")
 
 @app.route("/ask", methods=["POST"])
-def ask():
-    try:
-        d=request.get_json()
-        q_raw=d.get("question","") or ""
-        q_low=q_raw.lower()
-        lang=d.get("language","English")
-        file_ctx=d.get("file_context","")
-        image_ctx=d.get("image_context","")
-        history=d.get("history",[])[:12]
-        resolved_q = resolve_context(q_raw, history)
-        if any(k in q_low for k in ["generate image","create image","generate a picture","draw","picture of","image of","photo of","/image","show me picture","give me image"]):
-            if image_ctx and any(w in q_low for w in ["like this","this image","this picture","this person","who is this","describe this","analyze this"]):
-                wiki = get_wikipedia_real(image_ctx[:200])
-                if wiki["image"]:
-                    return jsonify({
-                        "answer": f"🖼️ You uploaded an image. My analysis: {image_ctx}\n\nHere is the real Wikipedia photo that matches:\n{wiki['text'][:600]}",
-                        "image_url": wiki["image"],
-                        "source_url": wiki["url"],
-                        "badge": f"Real Photo: {wiki['title']}"
-                    })
-                else:
-                    return jsonify({
-                        "answer": f"🖼️ Analysis of your uploaded image:\n{image_ctx}",
-                        "badge": "Image Understanding"
-                    })
-            prompt=q_raw
-            for k in ["generate image of","create image of","generate a picture of","generate a image of","generate image","create image","generate a","generate","draw","picture of","image of","photo of","/image","show me picture of","give me image of","picture of him","image of him","photo of him","him swearing in","swearing in"]:
-                if k in prompt.lower():
-                    prompt = prompt.lower().replace(k,"")
-            prompt=prompt.strip() or resolved_q
-            search_term = prompt if len(prompt)>2 else resolved_q
-            if not search_term or len(search_term)<2:
-                search_term = "John Dramani Mahama"
-            wiki = get_wikipedia_real(search_term)
-            if wiki["image"]:
-                return jsonify({
-                    "answer": f"📸 Real Wikipedia photo for: {search_term.title()}\n\n{wiki['text'][:800]}",
-                    "image_url": wiki["image"],
-                    "source_url": wiki["url"],
-                    "badge": f"Real Photo: {wiki['title']} | Wikipedia"
-                })
-            else:
-                return jsonify({
-                    "answer": f"🔍 I searched Wikipedia for '{search_term}' - {wiki['text'][:800] if wiki['text'] else 'No real photo found, but here is info.'}\n\nTry a more specific name like 'Kwame Nkrumah' or 'John Mahama'",
-                    "source_url": wiki["url"],
-                    "badge": "Wikipedia Search"
-                })
-        if any(k in q_low for k in ["create pdf","generate pdf","create document","export to pdf","create file","generate doc","make pdf"]):
-            try:
-                from reportlab.pdfgen import canvas
-                from reportlab.lib.pagesizes import A4
-                search_term = resolved_q.replace("create pdf","").replace("generate pdf","").replace("about","").strip() or "Ghana"
-                wiki = get_wikipedia_real(search_term)
-                fname=f"morr_{uuid.uuid4().hex[:8]}.pdf"
-                fpath=os.path.join(GENERATED_DIR, fname)
-                local_img = None
-                if wiki["image"]:
-                    try:
-                        r = requests.get(wiki["image"], timeout=10, headers={"User-Agent":"MORR AI GH"})
-                        if r.status_code == 200:
-                            ext = ".jpg"
-                            if ".png" in wiki["image"]: ext=".png"
-                            local_img = os.path.join(GENERATED_DIR, f"img_{uuid.uuid4().hex[:6]}{ext}")
-                            with open(local_img, "wb") as f: f.write(r.content)
-                    except: pass
-                c=canvas.Canvas(fpath, pagesize=A4)
-                w,h = A4
-                c.setFont("Helvetica-Bold",18)
-                c.drawString(50,h-60,f"MORR AI GH - Real Document")
-                c.setFont("Helvetica-Bold",14)
-                c.drawString(50,h-90,f"Topic: {wiki['title'] or search_term}")
-                c.setFont("Helvetica",10)
-                c.drawString(50,h-110,f"Source: {wiki['url'] or 'Wikipedia'}")
-                if local_img and os.path.exists(local_img):
-                    try:
-                        c.drawImage(local_img, 50, h-300, width=200, height=150, preserveAspectRatio=True)
-                        y_start = h-320
-                    except:
-                        y_start = h-140
-                else:
-                    y_start = h-140
-                y = y_start
-                c.setFont("Helvetica",11)
-                full_text = wiki["text"] or f"No Wikipedia summary found for {search_term}"
-                words = full_text.split()
-                line=""
-                for word in words:
-                    if len(line+word) > 85:
-                        c.drawString(50,y,line)
-                        y-=15
-                        line=word+" "
-                        if y<80:
-                            c.showPage()
-                            y=h-50
-                            c.setFont("Helvetica",11)
-                    else:
-                        line+=word+" "
-                if line:
-                    c.drawString(50,y,line)
-                if file_ctx or image_ctx:
-                    c.showPage()
-                    c.setFont("Helvetica-Bold",12)
-                    c.drawString(50,h-60,"Uploaded File Context:")
-                    c.setFont("Helvetica",10)
-                    y=h-80
-                    combined = (file_ctx + "\n" + image_ctx)[:3000]
-                    for line in combined.split("\n")[:60]:
-                        c.drawString(50,y,line[:90])
-                        y-=12
-                        if y<50: break
-                c.save()
-                return jsonify({
-                    "answer": f"📄 Created PDF with REAL Wikipedia data for: {wiki['title'] or search_term}\n\n{wiki['text'][:500]}",
-                    "file_url": f"/download/{fname}",
-                    "source_url": wiki["url"],
-                    "badge": "Real Wiki PDF with Photo"
-                })
-            except Exception as e:
-                return jsonify({"answer": f"PDF error: {e}"})
-        ans = None
-        wiki_data = None
+def ask_route():
+    data=request.get_json(); q=data.get("question","").strip()
+    if not q: return jsonify({"answer":"Ask something"})
+    # 1. Search whole internet
+    web = search_whole_internet(q)
+    # 2. Ask smart brain
+    answer = ask_smart_brain(q, web["text"], "", "English")
+    # Save chat if logged in
+    if session.get("user_id"):
         try:
-            if client:
-                system_prompt = f"You are MORR AI GH, Ghana's smartest AI like Meta AI, GPT, DeepSeek, Kimi. Language: {lang}. Be helpful, concise, smart. Remember history."
-                full_prompt = system_prompt + "\n\n"
-                if file_ctx:
-                    full_prompt += f"UPLOADED FILE CONTENT TO STUDY:\n{file_ctx[:4000]}\n\n"
-                if image_ctx:
-                    full_prompt += f"UPLOADED IMAGE ANALYSIS:\n{image_ctx[:2000]}\n\n"
-                if history:
-                    full_prompt += "CONVERSATION HISTORY (use this for 'his wife' etc):\n"
-                    for h in history[-6:]:
-                        full_prompt += f"{h.get('role')}: {h.get('content','')[:400]}\n"
-                full_prompt += f"\nUser question (resolved context: {resolved_q}): {q_raw}\nIf question is about a real person/place, I will search Wikipedia for you, but answer directly.\nAssistant:"
-                resp = client.models.generate_content(
-                    model=MODEL_NAME,
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        tools=[types.Tool(google_search=types.GoogleSearch())]
-                    )
-                )
-                ans = resp.text
-        except Exception as e:
-            print(f"Gemini failed: {e}")
-            ans = None
-        if not ans:
-            wiki_data = get_wikipedia_real(resolved_q)
-            if wiki_data["text"]:
-                ans = f"{wiki_data['text']}\n"
-            else:
-                ans = f"I couldn't get live answer, but here's what I know about '{resolved_q}'. Please rephrase."
-        image_url = None
-        source_url = None
-        badge = None
-        if not any(k in q_low for k in ["generate image","create image"]):
-            wiki_for_image = wiki_data or get_wikipedia_real(resolved_q)
-            if wiki_for_image["image"]:
-                image_url = wiki_for_image["image"]
-                source_url = wiki_for_image["url"]
-                badge = f"Real Photo: {wiki_for_image['title']}"
-        audio_url=None
-        try:
-            if HAS_GTTS and ans:
-                fname_a=f"morr_{uuid.uuid4().hex[:6]}.mp3"
-                fpath_a=os.path.join(GENERATED_DIR, fname_a)
-                gTTS(text=ans[:400], lang='en').save(fpath_a)
-                audio_url=f"/audio/{fname_a}"
+            conn=sqlite3.connect('morr.db'); c=conn.cursor()
+            c.execute("INSERT INTO chats (user_id,title,q,a) VALUES (?,?,?,?)", (session["user_id"], q[:50], q, answer))
+            conn.commit(); conn.close()
         except: pass
-        return jsonify({
-            "answer": ans,
-            "image_url": image_url,
-            "source_url": source_url,
-            "badge": badge,
-            "audio_url": audio_url
-        })
-    except Exception as e:
-        return jsonify({"answer": f"Server error: {str(e)[:600]}"}), 500
-
-@app.route("/voice", methods=["POST"])
-def voice():
-    f=request.files.get("audio")
-    if not f:
-        return jsonify({"text":""})
-    tmp=os.path.join(tempfile.gettempdir(), f"voice_{uuid.uuid4().hex}.webm")
-    f.save(tmp)
-    txt=""
-    try:
-        if client:
-            uploaded = client.files.upload(file=tmp)
-            resp = client.models.generate_content(model=MODEL_NAME, contents=["Transcribe this audio exactly:", uploaded])
-            txt = resp.text or ""
-    except: txt=""
-    try: os.remove(tmp)
-    except: pass
-    return jsonify({"text": txt.strip()})
-
-@app.route("/download/<filename>")
-def download_file(filename):
-    p=os.path.join(GENERATED_DIR, filename)
-    if os.path.exists(p):
-        return send_file(p, as_attachment=True)
-    return "not found",404
-
-@app.route("/audio/<filename>")
-def serve_audio(filename):
-    p=os.path.join(GENERATED_DIR, filename)
-    if os.path.exists(p):
-        return send_file(p, mimetype="audio/mpeg")
-    return "not found",404
+    return jsonify({"answer": answer, "sources": web["sources"]})
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",5000)))
