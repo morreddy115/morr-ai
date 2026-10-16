@@ -136,7 +136,7 @@ a{color:#FFD700}
 <div style="margin-top:12px" id="histList"></div>
 </div>
 <div id="main">
-<div id="chat"><div class="msg ai">Akwaaba! I am MORR AI V3 🇬🇭\nNow I search the WHOLE internet (not just Wikipedia) and I use Llama brain like Meta AI.\nTry: "President of Gabon", "How are you doing", "President of Jamaica"\nHow I fit help you today?</div></div>
+<div id="chat"><div class="msg ai">Akwaaba! I am MORR AI V3 🇬🇭\nHow May I Help You Today</div></div>
 <div class="input-area"><div class="row">
 <input id="q" placeholder="Ask anything... Twi, Pidgin, English"><button class="btn" onclick="send()">➤</button>
 </div><div id="status" style="max-width:900px;margin:5px auto;color:#FFD700;font-size:12px"></div></div>
