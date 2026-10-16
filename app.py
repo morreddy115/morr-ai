@@ -95,7 +95,7 @@ def get_wikipedia_real(query):
             result["title"] = "John Dramani Mahama"
     return result
 
-HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - Real Wiki</title>
+HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI - Real Wiki</title>
 <style>
 body{background:#0a0a0a;color:white;font-family:system-ui;margin:0;padding:0;display:flex;flex-direction:column;height:100vh}
 .header{padding:14px;text-align:center;border-bottom:1px solid #222}
@@ -115,7 +115,7 @@ select{background:#2a2a2a;color:white;padding:10px;border-radius:10px;border:non
 .msg a{color:#FFD700}
 .badge{display:inline-block;background:#333;color:#FFD700;padding:2px 8px;border-radius:8px;font-size:11px;margin-bottom:6px}
 </style></head><body>
-<div class="header"><h1>MORR AI GH 🇬🇭 <img src="https://flagcdn.com/w20/gh.png" style="width:20px;border-radius:3px"></h1><div class="sub">Real Wikipedia Photos • Smart Memory • File & Image Reader • Like Meta AI / GPT</div></div>
+<div class="header"><h1>MORR AI GH <img src="https://flagcdn.com/w20/gh.png" style="width:20px;border-radius:3px"></h1><div class="sub">Real Wikipedia Photos • Smart Memory • File & Image Reader • Like Meta AI / GPT</div></div>
 <div id="chat"></div>
 <div class="input-area"><div id="status" style="color:#FFD700;font-size:12px"></div>
 <div class="row"><select id="lang"><option>English</option><option>Pidgin</option><option>Twi</option><option>Hausa</option></select>
@@ -159,7 +159,7 @@ async function toggleMic(){
  }catch(e){document.getElementById('status').innerText='Mic error: '+e.message;}
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
-addMsg('ai',"Akwaaba! I am MORR AI GH 🇬🇭<br>I Operates In English, Pidgin, Twi & Hausa<br>How May I Help You Today?",true);
+addMsg('ai',"Akwaaba! I am MORR AI 🇬🇭<br>I Operates In English, Pidgin, Twi & Hausa<br>How May I Help You Today?",true);
 </script></body></html>"""
 
 @app.route("/")
