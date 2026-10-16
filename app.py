@@ -26,12 +26,10 @@ os.makedirs(GENERATED_DIR, exist_ok=True)
 # ===== SMART MEMORY RESOLVER =====
 def resolve_context(query, history):
     q_low = query.lower().strip()
-    # pronouns like his wife, his children, etc
     if any(p in q_low for p in ["his wife", "her husband", "his husband", "who is his", "who is her", "his children", "her children", "his wife name", "picture of him", "image of him", "photo of him", "him swearing"]):
         for h in reversed(history):
             c = h.get('content','')
             if not c: continue
-            # Find last known person
             if 'John Dramani Mahama' in c or 'John Mahama' in c:
                 if 'wife' in q_low: return "Lordina Mahama wife of John Mahama"
                 if 'children' in q_low: return "John Mahama children"
@@ -42,7 +40,6 @@ def resolve_context(query, history):
                 return "Kwame Nkrumah"
             if 'President of Ghana' in c:
                 return "John Dramani Mahama President of Ghana"
-        # if still ambiguous
         if q_low in ["who is his wife", "who is her husband"]:
             return "John Dramani Mahama wife Lordina Mahama"
     return query
@@ -52,12 +49,9 @@ def get_wikipedia_real(query):
     clean_q = query.strip()
     if not clean_q:
         return {"text":"Please ask a question.", "image":None, "url":None, "title":None}
-
     headers = {"User-Agent": "MORR AI GH/1.0 (Educational Bot; Ghana)"}
     result = {"text":"", "image":None, "url":None, "title":None}
-
     try:
-        # 1. Search Wikipedia
         search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(clean_q)}&format=json&srlimit=1"
         r = requests.get(search_url, timeout=12, headers=headers)
         if r.status_code == 200:
@@ -66,20 +60,16 @@ def get_wikipedia_real(query):
             if hits:
                 title = hits[0].get("title", "")
                 result["title"] = title
-                # 2. Get summary + real image
                 summary_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(title)}"
                 r2 = requests.get(summary_url, timeout=12, headers=headers)
                 if r2.status_code == 200:
                     j = r2.json()
                     result["text"] = j.get("extract", "")
                     result["url"] = j.get("content_urls", {}).get("desktop", {}).get("page", "")
-                    # Real photo - originalimage is best
                     if j.get("originalimage"):
                         result["image"] = j.get("originalimage", {}).get("source")
                     elif j.get("thumbnail"):
                         result["image"] = j.get("thumbnail", {}).get("source")
-
-                # 3. If no image in summary, try pageimages API
                 if not result["image"]:
                     img_url = f"https://en.wikipedia.org/w/api.php?action=query&titles={urllib.parse.quote(title)}&prop=pageimages&format=json&pithumbsize=800"
                     r3 = requests.get(img_url, timeout=12, headers=headers)
@@ -91,8 +81,6 @@ def get_wikipedia_real(query):
                                 break
     except Exception as e:
         print(f"Wiki real error: {e}")
-
-    # Fallbacks for common Ghana/Mexico
     if not result["text"]:
         low = clean_q.lower()
         if "lordina" in low or "mahama wife" in low:
@@ -105,7 +93,6 @@ def get_wikipedia_real(query):
             result["image"] = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/4d/John_Dramani_Mahama.jpg/440px-John_Dramani_Mahama.jpg"
             result["url"] = "https://en.wikipedia.org/wiki/John_Dramani_Mahama"
             result["title"] = "John Dramani Mahama"
-
     return result
 
 HTML = """<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - Real Wiki</title>
@@ -172,7 +159,7 @@ async function toggleMic(){
  }catch(e){document.getElementById('status').innerText='Mic error: '+e.message;}
 }
 document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')sendText();});
-addMsg('ai',"Akwaaba! I am the NEW MORR AI GH 🇬🇭<br><br>✅ Real photos from Wikipedia (not fake AI)<br>✅ I remember context — ask 'who is his wife' after President<br>✅ Upload any image or file — I will read & understand it<br>✅ File generation uses real Wiki data<br><br>Try: 'President of Ghana' then 'Generate image of him'",true);
+addMsg('ai',"Akwaaba! I am MORR AI GH 🇬🇭<br>I Operates In English, Pidgin, Twi & Hausa<br>How May I Help You Today?",true);
 </script></body></html>"""
 
 @app.route("/")
@@ -190,13 +177,10 @@ def upload():
     image_desc = ""
     preview_url = None
     is_image = name.endswith(('.jpg','.jpeg','.png','.webp','.bmp'))
-
     try:
         if is_image:
-            # Save copy for preview
             preview_name = f"prev_{uuid.uuid4().hex[:8]}_{os.path.basename(tmp_path)}"
             preview_path = os.path.join(GENERATED_DIR, preview_name)
-            # Resize for preview to avoid large files
             from PIL import Image
             try:
                 im = Image.open(tmp_path)
@@ -205,8 +189,6 @@ def upload():
                 preview_url = f"/download/{preview_name}"
             except:
                 preview_url = None
-
-            # Try Gemini Vision to understand image
             if client:
                 try:
                     uploaded = client.files.upload(file=tmp_path)
@@ -236,7 +218,6 @@ def upload():
             text=f"[File {f.filename} uploaded - type not fully supported but noted]"
     except Exception as e:
         text = f"[File {f.filename} read error: {e}]"
-
     return jsonify({"text":text, "image_desc":image_desc, "preview":preview_url})
 
 @app.route("/ask", methods=["POST"])
@@ -249,15 +230,9 @@ def ask():
         file_ctx=d.get("file_context","")
         image_ctx=d.get("image_context","")
         history=d.get("history",[])[:12]
-
-        # Resolve pronoun history
         resolved_q = resolve_context(q_raw, history)
-
-        # ===== 1. IMAGE REQUEST = REAL WIKIPEDIA PHOTO =====
         if any(k in q_low for k in ["generate image","create image","generate a picture","draw","picture of","image of","photo of","/image","show me picture","give me image"]):
-            # If user uploaded an image and says "like this" or "this person"
             if image_ctx and any(w in q_low for w in ["like this","this image","this picture","this person","who is this","describe this","analyze this"]):
-                # Use the uploaded image description + search for real match if possible
                 wiki = get_wikipedia_real(image_ctx[:200])
                 if wiki["image"]:
                     return jsonify({
@@ -271,18 +246,14 @@ def ask():
                         "answer": f"🖼️ Analysis of your uploaded image:\n{image_ctx}",
                         "badge": "Image Understanding"
                     })
-
-            # Normal image generation = real wiki photo
             prompt=q_raw
             for k in ["generate image of","create image of","generate a picture of","generate a image of","generate image","create image","generate a","generate","draw","picture of","image of","photo of","/image","show me picture of","give me image of","picture of him","image of him","photo of him","him swearing in","swearing in"]:
                 if k in prompt.lower():
                     prompt = prompt.lower().replace(k,"")
             prompt=prompt.strip() or resolved_q
-            # Use resolved context
             search_term = prompt if len(prompt)>2 else resolved_q
             if not search_term or len(search_term)<2:
                 search_term = "John Dramani Mahama"
-
             wiki = get_wikipedia_real(search_term)
             if wiki["image"]:
                 return jsonify({
@@ -292,14 +263,11 @@ def ask():
                     "badge": f"Real Photo: {wiki['title']} | Wikipedia"
                 })
             else:
-                # No real image, but still give text
                 return jsonify({
                     "answer": f"🔍 I searched Wikipedia for '{search_term}' - {wiki['text'][:800] if wiki['text'] else 'No real photo found, but here is info.'}\n\nTry a more specific name like 'Kwame Nkrumah' or 'John Mahama'",
                     "source_url": wiki["url"],
                     "badge": "Wikipedia Search"
                 })
-
-        # ===== 2. FILE GENERATION = REAL WIKI DATA + REAL IMAGE =====
         if any(k in q_low for k in ["create pdf","generate pdf","create document","export to pdf","create file","generate doc","make pdf"]):
             try:
                 from reportlab.pdfgen import canvas
@@ -308,8 +276,6 @@ def ask():
                 wiki = get_wikipedia_real(search_term)
                 fname=f"morr_{uuid.uuid4().hex[:8]}.pdf"
                 fpath=os.path.join(GENERATED_DIR, fname)
-
-                # Download real image if available
                 local_img = None
                 if wiki["image"]:
                     try:
@@ -320,7 +286,6 @@ def ask():
                             local_img = os.path.join(GENERATED_DIR, f"img_{uuid.uuid4().hex[:6]}{ext}")
                             with open(local_img, "wb") as f: f.write(r.content)
                     except: pass
-
                 c=canvas.Canvas(fpath, pagesize=A4)
                 w,h = A4
                 c.setFont("Helvetica-Bold",18)
@@ -329,8 +294,6 @@ def ask():
                 c.drawString(50,h-90,f"Topic: {wiki['title'] or search_term}")
                 c.setFont("Helvetica",10)
                 c.drawString(50,h-110,f"Source: {wiki['url'] or 'Wikipedia'}")
-
-                # Add image to PDF
                 if local_img and os.path.exists(local_img):
                     try:
                         c.drawImage(local_img, 50, h-300, width=200, height=150, preserveAspectRatio=True)
@@ -339,11 +302,9 @@ def ask():
                         y_start = h-140
                 else:
                     y_start = h-140
-
                 y = y_start
                 c.setFont("Helvetica",11)
                 full_text = wiki["text"] or f"No Wikipedia summary found for {search_term}"
-                # Simple text wrapping
                 words = full_text.split()
                 line=""
                 for word in words:
@@ -359,8 +320,6 @@ def ask():
                         line+=word+" "
                 if line:
                     c.drawString(50,y,line)
-
-                # Add file context if uploaded
                 if file_ctx or image_ctx:
                     c.showPage()
                     c.setFont("Helvetica-Bold",12)
@@ -372,7 +331,6 @@ def ask():
                         c.drawString(50,y,line[:90])
                         y-=12
                         if y<50: break
-
                 c.save()
                 return jsonify({
                     "answer": f"📄 Created PDF with REAL Wikipedia data for: {wiki['title'] or search_term}\n\n{wiki['text'][:500]}",
@@ -382,8 +340,6 @@ def ask():
                 })
             except Exception as e:
                 return jsonify({"answer": f"PDF error: {e}"})
-
-        # ===== 3. SMART CHAT (GEMINI + WIKI + FILE + IMAGE) =====
         ans = None
         wiki_data = None
         try:
@@ -410,26 +366,21 @@ def ask():
         except Exception as e:
             print(f"Gemini failed: {e}")
             ans = None
-
         if not ans:
             wiki_data = get_wikipedia_real(resolved_q)
             if wiki_data["text"]:
                 ans = f"{wiki_data['text']}\n"
             else:
                 ans = f"I couldn't get live answer, but here's what I know about '{resolved_q}'. Please rephrase."
-
-        # Attach real image if query is about a person and we have one
         image_url = None
         source_url = None
         badge = None
         if not any(k in q_low for k in ["generate image","create image"]):
-            # For chat queries like "president of ghana" or "who is his wife", also attach real photo
             wiki_for_image = wiki_data or get_wikipedia_real(resolved_q)
             if wiki_for_image["image"]:
                 image_url = wiki_for_image["image"]
                 source_url = wiki_for_image["url"]
                 badge = f"Real Photo: {wiki_for_image['title']}"
-
         audio_url=None
         try:
             if HAS_GTTS and ans:
@@ -438,7 +389,6 @@ def ask():
                 gTTS(text=ans[:400], lang='en').save(fpath_a)
                 audio_url=f"/audio/{fname_a}"
         except: pass
-
         return jsonify({
             "answer": ans,
             "image_url": image_url,
@@ -446,7 +396,6 @@ def ask():
             "badge": badge,
             "audio_url": audio_url
         })
-
     except Exception as e:
         return jsonify({"answer": f"Server error: {str(e)[:600]}"}), 500
 
