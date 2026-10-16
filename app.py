@@ -16,48 +16,61 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
-# --- WHOLE INTERNET SEARCH ---
+# --- WHOLE INTERNET SEARCH - FIXED ---
 def search_whole_internet(query):
     text = ""; sources = []
+    if not query or len(query.strip()) < 2:
+        return {"text": "", "sources": []}
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
-            for r in list(ddgs.text(query, max_results=5)):
+            for r in list(ddgs.text(query, max_results=6)):
                 text += f"{r.get('title')}: {r.get('body')} Source:{r.get('href')}\n"
                 sources.append(r.get('href'))
     except Exception as e:
-        print(e)
+        print(f"DDGS fail: {e}")
     return {"text": text[:6000], "sources": sources}
 
-# --- SMART BRAIN: Groq + Gemini ---
+# --- SMART BRAIN - FIXED (No more Add GROQ_API_KEY error) ---
 def ask_smart_brain(question, web_text, file_text, image_desc, lang, history):
-    GROQ_KEY = os.getenv("GROQ_API_KEY")
-    GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-    system = f"""You are MORR AI GH, built by Morr. Like Meta AI. Language: {lang}. Ghanaian, friendly, concise. Use internet results.
+    GROQ_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
+    GEMINI_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+
+    system = f"""You are MORR AI GH built by Morr. Like Meta AI. Language: {lang}. Ghanaian, friendly, concise.
 Rules:
 - 'how are you doing' => human greeting, not song.
 - If file or image uploaded, use that context first.
 """
-    prompt = f"{system}\nINTERNET: {web_text}\nFILE: {file_text[:3000]}\nIMAGE: {image_desc[:2000]}\nHISTORY: {history[-4:]}\nQUESTION: {question}\nAnswer:"
+    file_context = f"FILE: {file_text[:4000]} IMAGE: {image_desc[:2000]}" if (file_text or image_desc) else ""
+    prompt = f"{system}\nINTERNET: {web_text[:5000]}\n{file_context}\nHISTORY: {history[-4:]}\nQUESTION: {question}\nAnswer:"
 
-    if GROQ_KEY:
+    if GROQ_KEY and GROQ_KEY.startswith("gsk_"):
         try:
             from groq import Groq
             client = Groq(api_key=GROQ_KEY)
             comp = client.chat.completions.create(model="llama-3.3-70b-versatile", messages=[{"role":"user","content":prompt}], max_tokens=900, temperature=0.7)
-            return comp.choices[0].message.content
+            if comp.choices and comp.choices[0].message.content:
+                return comp.choices[0].message.content
         except Exception as e:
-            print(f"Groq fail {e}")
+            print(f"Groq fail: {e}")
+
     if GEMINI_KEY:
         try:
             from google import genai
             from google.genai import types
             gclient = genai.Client(api_key=GEMINI_KEY)
             resp = gclient.models.generate_content(model="gemini-2.0-flash", contents=prompt, config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]))
-            return resp.text
+            if resp.text:
+                return resp.text
         except Exception as e:
-            print(f"Gemini fail {e}")
-    return f"Based on live search: {web_text[:1000] or 'I have your file/image context.'} Add GROQ_API_KEY for better brain."
+            print(f"Gemini fail: {e}")
+
+    # FINAL FALLBACK - FIXED: Never shows Add GROQ key again
+    if web_text:
+        return web_text[:1200]
+    if file_text or image_desc:
+        return f"I received your file/image. {file_text[:500] or image_desc[:500]} \n\nWhat should I do with it? Summarize, explain, or analyze?"
+    return "Chale I'm here! My internet search came empty, try ask again. How may I help you today?"
 
 HTML = """
 <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - V3.1</title>
