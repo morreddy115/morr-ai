@@ -9,3 +9,5 @@ reportlab
 Pillow
 requests
 beautifulsoup4
+duckduckgo-search
+groq
