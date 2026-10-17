@@ -1,13 +1,11 @@
 Flask
 gunicorn
 google-genai
-python-dotenv
 gTTS
 PyPDF2
 python-docx
-reportlab
 Pillow
 requests
 beautifulsoup4
-duckduckgo-search
-groq
+ddgs
+psycopg2-binary
