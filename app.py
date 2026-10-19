@@ -1,4 +1,4 @@
-import os, re, io, uuid, time, secrets, sqlite3, socket, ipaddress, tempfile, urllib.parse
+import os, re, io, base64, uuid, time, secrets, sqlite3, socket, ipaddress, tempfile, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -62,7 +62,7 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def cleanup_old_files(max_age=3600):
+def cleanup_old_files(max_age=6 * 3600):
     try:
         cutoff = time.time() - max_age
         for name in os.listdir(GENERATED_DIR):
@@ -268,49 +268,87 @@ def should_search(q, has_attachment):
 MODEL_CACHE = {}
 
 
-def discover_gemini_model():
+COOLDOWN = {}  # model name -> time until which we skip it (after a 429 or 404)
+
+
+def _cooling(model):
+    return COOLDOWN.get(model, 0) > time.time()
+
+
+def discover_gemini_models():
+    """All usable Gemini flash models, newest first. 'lite' ones go last (they often have bigger free quotas)."""
+    found = []
     try:
-        best, best_key = None, None
         for m in gclient.models.list():
             name = (m.name or "").replace("models/", "")
-            if "flash" not in name or any(x in name for x in ("lite", "image", "tts", "live", "audio", "embed", "native", "robotics")):
+            if "gemini" not in name or "flash" not in name:
+                continue
+            if any(x in name for x in ("image", "tts", "live", "audio", "embed", "native", "robotics", "imagen")):
                 continue
             actions = getattr(m, "supported_actions", None)
             if actions and "generateContent" not in actions:
                 continue
             mt = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
-            key = (float(mt.group(1)) if mt else 0.0, -len(name))
-            if best_key is None or key > best_key:
-                best, best_key = name, key
-        print(f"[gemini] auto-detected model: {best}")
-        return best
+            ver = float(mt.group(1)) if mt else 0.0
+            found.append(("lite" in name, -ver, len(name), name))
     except Exception as e:
         print(f"[gemini] model discovery failed: {str(e)[:200]}")
-        return None
+    found.sort()
+    names = [f[3] for f in found]
+    print(f"[gemini] usable models: {names[:6]}")
+    return names
 
 
-def get_gemini_model():
-    return MODEL_CACHE.get("gemini") or os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
+def _compose_models(discovered):
+    lst = list(discovered)
+    forced = os.getenv("GEMINI_MODEL")
+    if forced:
+        lst = [forced] + [m for m in lst if m != forced]
+    return lst or ["gemini-3.8-flash"]
+
+
+def gemini_models():
+    lst = MODEL_CACHE.get("gemini_list")
+    if lst is None:
+        lst = _compose_models(discover_gemini_models() if gclient else [])
+        MODEL_CACHE["gemini_list"] = lst
+    return lst
 
 
 def gemini_generate(contents, system=None, use_search=False):
+    """Try every usable Gemini model in turn. Quota (429) and missing-model (404) errors move to the next one."""
     if not gclient:
         raise RuntimeError("Gemini is not configured")
-    for attempt in range(2):
-        model = get_gemini_model()
+    tried, last, refreshed = set(), None, False
+    queue = list(gemini_models())
+    while queue:
+        model = queue.pop(0)
+        if model in tried or _cooling(model):
+            continue
+        tried.add(model)
         try:
             cfg = types.GenerateContentConfig(
                 system_instruction=system, temperature=0.7,
                 tools=[types.Tool(google_search=types.GoogleSearch())] if use_search else None)
             return gclient.models.generate_content(model=model, contents=contents, config=cfg)
         except Exception as e:
+            last = e
             s = str(e)
-            if attempt == 0 and ("NOT_FOUND" in s or "404" in s[:30]):
-                new = discover_gemini_model()
-                if new and new != model:
-                    MODEL_CACHE["gemini"] = new
-                    continue
+            if "NOT_FOUND" in s or "404" in s[:30]:
+                COOLDOWN[model] = time.time() + 3600
+                if not refreshed:
+                    refreshed = True
+                    fresh = discover_gemini_models() if gclient else []
+                    if fresh:  # only replace the saved list if the fresh lookup actually worked
+                        MODEL_CACHE["gemini_list"] = _compose_models(fresh)
+                        queue.extend(m for m in MODEL_CACHE["gemini_list"] if m not in tried)
+                continue
+            if "429" in s[:30] or "RESOURCE_EXHAUSTED" in s:
+                COOLDOWN[model] = time.time() + 120
+                print(f"[gemini] {model} is over its quota, trying the next model")
+                continue
             raise
+    raise last or RuntimeError("All Gemini models are busy or unavailable right now")
 
 
 def gemini_sources(resp):
@@ -397,6 +435,196 @@ def call_openrouter(system, history, user_text):
                       messages, {"X-Title": "MORR AI GH"})
 
 
+# ===========================================================================
+# IMAGE READING (Gemini first, Groq vision as backup)
+# ===========================================================================
+def discover_groq_vision_model():
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=10)
+        r.raise_for_status()
+        ids = [m.get("id", "") for m in r.json().get("data", []) if m.get("active") is not False]
+        for key in ("maverick", "scout", "vision"):
+            for mid in ids:
+                low = mid.lower()
+                if key in low and not any(x in low for x in ("whisper", "guard", "tts")):
+                    print(f"[groq] auto-detected vision model: {mid}")
+                    return mid
+    except Exception as e:
+        print(f"[groq] vision model discovery failed: {str(e)[:200]}")
+    return None
+
+
+def groq_vision(jpeg_bytes, prompt):
+    if not GROQ_KEY:
+        raise RuntimeError("Groq is not configured")
+    b64 = base64.b64encode(jpeg_bytes).decode()
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}}]}]
+    forced = os.getenv("GROQ_VISION_MODEL")
+    for attempt in range(2):
+        model = MODEL_CACHE.get("groq_vision") or forced or discover_groq_vision_model()
+        if not model:
+            raise RuntimeError("No Groq vision model available")
+        MODEL_CACHE["groq_vision"] = model
+        try:
+            return _chat_post("https://api.groq.com/openai/v1/chat/completions", GROQ_KEY, model, messages)
+        except Exception as e:
+            s = str(e).lower()
+            if attempt == 0 and any(x in s for x in ("model_not_found", "decommissioned", "does not exist", "404")):
+                MODEL_CACHE.pop("groq_vision", None)
+                forced = None
+                continue
+            raise
+
+
+def describe_image(jpeg_bytes):
+    """Describe an image and read its text. Tries Gemini (all models), then Groq vision."""
+    errors = []
+    if gclient:
+        try:
+            resp = gemini_generate([types.Content(role="user", parts=[
+                types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+                types.Part(text=DESCRIBE_PROMPT)])])
+            if resp.text:
+                return resp.text
+        except Exception as e:
+            errors.append(f"gemini: {str(e)[:150]}")
+            print(f"[vision] gemini failed: {str(e)[:200]}")
+    if GROQ_KEY:
+        try:
+            text = groq_vision(jpeg_bytes, DESCRIBE_PROMPT)
+            if text:
+                return text
+        except Exception as e:
+            errors.append(f"groq: {str(e)[:150]}")
+            print(f"[vision] groq failed: {str(e)[:200]}")
+    raise RuntimeError("; ".join(errors) or "no image reader configured")
+
+
+# ===========================================================================
+# IMAGE GENERATION (Pollinations needs no key and has no quota; Gemini image models as backup)
+# ===========================================================================
+IMG_GEN_RE = re.compile(
+    r"\b(?:generate|create|make|draw|design|paint|produce|render)\b[^.?!\n]{0,40}?\b"
+    r"(?:image|images|picture|pictures|photo|pic|logo|poster|illustration|wallpaper|drawing|painting|flyer|banner|icon|cartoon|artwork)\b"
+    r"|^\s*(?:/image|/imagine|imagine|draw)\b", re.I)
+
+
+def wants_image(q):
+    if re.match(r"^\s*(how|what|why|explain|where|when|who)\b", q, re.I):
+        return False
+    return bool(IMG_GEN_RE.search(q))
+
+
+def clean_image_prompt(q):
+    s = re.sub(r"^\s*(?:please\s+|pls\s+|can you\s+|could you\s+)*(?:/image|/imagine|imagine|generate|create|make|draw|design|paint|produce)"
+               r"\s+(?:me\s+)?(?:an?\s+|the\s+)?(?:ai\s+)?(?:image|picture|photo|pic|logo|poster|illustration|drawing|painting)?"
+               r"\s*(?:of|for|showing|with)?\s*", "", q, flags=re.I).strip(" .:-")
+    return s or q
+
+
+def quick_llm(system, user):
+    """One short AI call (Groq first, then Gemini). Returns '' if nothing is available."""
+    if GROQ_KEY:
+        try:
+            return (call_groq(system, [], user) or "").strip()
+        except Exception as e:
+            print(f"[quick_llm] groq failed: {str(e)[:150]}")
+    if gclient:
+        try:
+            resp = gemini_generate([types.Content(role="user", parts=[types.Part(text=user)])], system)
+            return (resp.text or "").strip()
+        except Exception as e:
+            print(f"[quick_llm] gemini failed: {str(e)[:150]}")
+    return ""
+
+
+def _save_generated(data):
+    from PIL import Image
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    im = im.convert("RGB")
+    cleanup_old_files()
+    name = f"gen_{uuid.uuid4().hex[:8]}.jpg"
+    im.save(os.path.join(GENERATED_DIR, name), "JPEG", quality=90)
+    return name
+
+
+def pollinations_image(prompt):
+    r = requests.get("https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt[:600]),
+                     params={"width": 768, "height": 768, "nologo": "true", "seed": secrets.randbelow(10 ** 6)},
+                     headers={"User-Agent": BROWSER_UA}, timeout=70)
+    if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image/"):
+        raise RuntimeError(f"pollinations returned {r.status_code}")
+    return r.content
+
+
+def gemini_image(prompt):
+    if not gclient:
+        raise RuntimeError("Gemini is not configured")
+    names = MODEL_CACHE.get("gemini_image")
+    if names is None:
+        names = []
+        try:
+            for m in gclient.models.list():
+                n = (m.name or "").replace("models/", "")
+                if "gemini" in n and "image" in n:
+                    names.append(n)
+        except Exception as e:
+            print(f"[image] could not list Gemini image models: {str(e)[:150]}")
+        MODEL_CACHE["gemini_image"] = names
+    last = None
+    for model in names[:2]:
+        if _cooling(model):
+            continue
+        try:
+            resp = gclient.models.generate_content(
+                model=model, contents=prompt,
+                config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]))
+            for part in resp.candidates[0].content.parts:
+                inline = getattr(part, "inline_data", None)
+                if inline and inline.data:
+                    return inline.data
+        except Exception as e:
+            last = e
+            COOLDOWN[model] = time.time() + 600
+            print(f"[image] gemini {model} failed: {str(e)[:150]}")
+    raise last or RuntimeError("Gemini returned no image")
+
+
+def generate_image(prompt):
+    errors = []
+    for provider, fn in (("pollinations", pollinations_image), ("gemini", gemini_image)):
+        try:
+            return _save_generated(fn(prompt)), provider
+        except Exception as e:
+            errors.append(f"{provider}: {str(e)[:120]}")
+            print(f"[image] {provider} failed: {str(e)[:200]}")
+    raise RuntimeError("; ".join(errors))
+
+
+def make_image_answer(q):
+    """Returns (answer, sources, provider, image_filename_or_None)."""
+    base = clean_image_prompt(q)
+    prompt = base
+    try:
+        better = quick_llm("You write prompts for an AI image generator. Reply with ONE vivid English prompt "
+                           "(max 50 words) and nothing else.", f"Turn this request into an image prompt: {q}")
+        better = better.strip().strip('"').strip()
+        if 5 < len(better) < 600:
+            prompt = better
+    except Exception as e:
+        print(f"[image] prompt rewrite failed: {e}")
+    try:
+        name, provider = generate_image(prompt)
+        return f"🎨 Here is your image: {base[:120]}", [], f"image-{provider}", name
+    except Exception:
+        return ("Sorry, I could not draw that right now because the image services are busy. "
+                "Please try again in a minute."), [], "image-failed", None
+
+
 def build_system(lang):
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
     if lang and lang != "Auto":
@@ -416,6 +644,7 @@ def build_system(lang):
         "(for example: Jamaica has a Prime Minister, not a President).\n"
         "- If you are not sure, say so plainly. Never invent facts, names, numbers or links.\n"
         "- If a file or image is attached, use it first.\n"
+        "- You can also draw images. If the user wants one, tell them to say, for example, 'generate an image of ...'.\n"
         "- Be concise. Use short paragraphs, and lists only when they help."
     )
 
@@ -588,7 +817,7 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 function fmt(s){return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/(https?:\/\/[^\s<]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
 function addMsg(role,html){const d=document.createElement('div');d.className='msg '+role;d.innerHTML=html;$('chat').appendChild(d);$('chat').scrollTop=$('chat').scrollHeight;return d;}
 function srcHtml(srcs){if(!srcs||!srcs.length)return '';return '<span class="src">Sources: '+srcs.slice(0,3).map(s=>'<a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc((s.title||s.url).substring(0,40))+'</a>').join(' · ')+'</span>';}
-function welcome(){addMsg('ai','Akwaaba! I am MORR AI 🇬🇭<br>I speak English, Pidgin, Twi, Hausa and more. How may I help you today?');}
+function welcome(){addMsg('ai','Akwaaba! I am MORR AI 🇬🇭<br>I speak English, Pidgin, Twi, Hausa and more. I can read your files and photos, and draw images too (try: generate an image of a sunset in Accra). How may I help you today?');}
 function toggleSide(){$('sidebar').classList.toggle('open');$('overlay').classList.toggle('open');}
 function toggleSpeak(){speak=!speak;localStorage.setItem('morr_speak',speak?'1':'0');$('spkBtn').style.opacity=speak?1:.4;}
 $('spkBtn').style.opacity=speak?1:.4;
@@ -639,7 +868,8 @@ async function send(){
  try{
   const res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const data=await res.json();$('status').innerText='';
-  addMsg('ai',fmt(data.answer||'No answer')+srcHtml(data.sources));
+  const extra=data.image_url?'<br><img src="'+esc(data.image_url)+'"><br><a href="'+esc(data.download_url||data.image_url)+'">⬇️ Download image</a>':'';
+  addMsg('ai',fmt(data.answer||'No answer')+extra+srcHtml(data.sources));
   if(LOGGED_IN&&data.conversation_id){currentConv=data.conversation_id;loadConvs();}
   if(!LOGGED_IN){guestHist.push({role:'user',content:q},{role:'assistant',content:data.answer||''});guestHist=guestHist.slice(-10);}
   if(data.audio_url){const p=$('player');p.style.display='block';p.src=data.audio_url;p.play().catch(()=>{});}
@@ -652,7 +882,7 @@ async function handleFile(){
  const fd=new FormData();fd.append('file',f);
  try{
   const data=await (await fetch('/upload',{method:'POST',body:fd})).json();
-  if(data.error){$('status').innerText='⚠️ '+data.error;attachText='';attachImg='';attachName='';return;}
+  if(data.error){$('status').innerText='';addMsg('ai','⚠️ '+esc(data.error));attachText='';attachImg='';attachName='';return;}
   attachText=data.text||'';attachImg=data.image_desc||'';attachName=f.name;
   $('status').innerText='✅ '+f.name+' attached. Now type your question (or just press send).';
   if(data.preview)addMsg('user','📎 '+esc(f.name)+'<br><img src="'+data.preview+'">');
@@ -836,11 +1066,15 @@ def ask_route():
         print(f"[ask] history load failed: {e}")
         conv_id = None
 
-    try:
-        ans, sources, provider = generate_answer(q, lang, file_ctx, img_ctx, history)
-    except Exception as e:
-        print(f"[ask] unexpected failure: {e}")
-        return jsonify({"answer": "Something went wrong on my side. Please try again."}), 500
+    image_name = None
+    if not (file_ctx or img_ctx) and wants_image(q):
+        ans, sources, provider, image_name = make_image_answer(q)
+    else:
+        try:
+            ans, sources, provider = generate_answer(q, lang, file_ctx, img_ctx, history)
+        except Exception as e:
+            print(f"[ask] unexpected failure: {e}")
+            return jsonify({"answer": "Something went wrong on my side. Please try again."}), 500
     print(f"[ask] answered by {provider}")
 
     if uid:
@@ -859,8 +1093,10 @@ def ask_route():
         except Exception as e:
             print(f"[ask] saving chat failed: {e}")
 
-    audio_url = make_audio(ans, lang) if d.get("speak") else None
-    return jsonify({"answer": ans, "sources": sources, "audio_url": audio_url, "conversation_id": conv_id})
+    audio_url = make_audio(ans, lang) if d.get("speak") and not image_name else None
+    return jsonify({"answer": ans, "sources": sources, "audio_url": audio_url, "conversation_id": conv_id,
+                    "image_url": f"/media/{image_name}" if image_name else None,
+                    "download_url": f"/download/{image_name}" if image_name else None})
 
 
 # ===========================================================================
@@ -894,16 +1130,13 @@ def upload():
             pname = f"prev_{uuid.uuid4().hex[:8]}.jpg"
             im.save(os.path.join(GENERATED_DIR, pname), "JPEG", quality=85)
             preview = f"/media/{pname}"
-            if not gclient:
-                return jsonify({"error": "Image reading needs GEMINI_API_KEY to be set."})
+            if not (gclient or GROQ_KEY):
+                return jsonify({"error": "Image reading needs GEMINI_API_KEY or GROQ_API_KEY to be set."})
             try:
-                resp = gemini_generate([types.Content(role="user", parts=[
-                    types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
-                    types.Part(text=DESCRIBE_PROMPT)])])
-                img_desc = resp.text or ""
+                img_desc = describe_image(buf.getvalue())
             except Exception as e:
                 print(f"[upload] image read failed: {str(e)[:300]}")
-                return jsonify({"error": "I could not read that image right now. Please try again in a moment."})
+                return jsonify({"error": "Both of my image readers are busy or at their daily limit. Please try again in a few minutes."})
             if not img_desc:
                 return jsonify({"error": "I could not make out anything in that image."})
         elif ext == ".pdf":
