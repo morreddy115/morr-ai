@@ -1,4 +1,4 @@
-import os, re, io, base64, uuid, time, secrets, sqlite3, socket, ipaddress, tempfile, urllib.parse
+import os, re, io, base64, hmac, hashlib, json, uuid, time, secrets, sqlite3, socket, ipaddress, tempfile, urllib.parse
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, render_template_string, request, jsonify, session, redirect, send_file
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ===========================================================================
 # SETUP
@@ -20,6 +21,7 @@ from werkzeug.utils import secure_filename
 #   PROVIDER_ORDER     optional, default "gemini,groq,openrouter"
 # ===========================================================================
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 SECRET = os.environ.get("SECRET_KEY")
 if not SECRET:
     SECRET = secrets.token_hex(32)
@@ -41,6 +43,37 @@ OPENROUTER_MODEL = (os.getenv("OPENROUTER_MODEL") or "").strip()
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "morr.db")
 PROVIDER_ORDER = [p.strip() for p in os.getenv("PROVIDER_ORDER", "gemini,groq,openrouter").split(",") if p.strip()]
+# Free and guest users use this order (default keeps Gemini, our best model, for Premium)
+FREE_PROVIDER_ORDER = [p.strip() for p in os.getenv("FREE_PROVIDER_ORDER", "groq,gemini,openrouter").split(",") if p.strip()]
+
+
+def _int_env(name, default):
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# --- Monetisation settings (all changeable on Render without touching the code) ---
+PAYSTACK_SECRET = (os.getenv("PAYSTACK_SECRET_KEY") or "").strip()
+PAYSTACK_PLAN = (os.getenv("PAYSTACK_PLAN_CODE") or "").strip()
+try:
+    PRICE_GHS = float(os.getenv("PREMIUM_PRICE_GHS", "53"))
+except ValueError:
+    PRICE_GHS = 53.0
+ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+SITE_URL = (os.getenv("SITE_URL") or "").strip().rstrip("/")
+SIGNUPS_PER_IP = _int_env("SIGNUPS_PER_IP", 3)
+DAYS_ONE_TIME = 30       # Mobile Money / one-off payment
+DAYS_SUBSCRIPTION = 32   # card subscription (a couple of spare days so a late renewal never cuts access)
+LIMITS = {
+    "guest": {"msg": _int_env("GUEST_MSGS", 5), "img": 0, "upload": 0, "voice": 0},
+    "free": {"msg": _int_env("FREE_MSGS", 20), "img": _int_env("FREE_IMGS", 3),
+             "upload": _int_env("FREE_UPLOADS", 3), "voice": _int_env("FREE_VOICE", 20)},
+    "premium": {"msg": _int_env("PREMIUM_MSGS", 500), "img": _int_env("PREMIUM_IMGS", 50),
+                "upload": _int_env("PREMIUM_UPLOADS", 50), "voice": _int_env("PREMIUM_VOICE", 200)},
+}
+MAX_UPLOAD_MB = {"free": _int_env("FREE_UPLOAD_MB", 5), "premium": _int_env("PREMIUM_UPLOAD_MB", 20)}
 
 gclient = None
 types = None
@@ -116,6 +149,12 @@ def init_db():
         db(f"CREATE TABLE IF NOT EXISTS messages (id {pk}, conversation_id INTEGER NOT NULL, role TEXT, content TEXT, created TEXT)")
         db("CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations (user_id, updated)")
         db("CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages (conversation_id)")
+        db("CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, premium_until TEXT, sub_code TEXT, "
+           "email_token TEXT, auto_renew INTEGER DEFAULT 0, updated TEXT)")
+        db("CREATE TABLE IF NOT EXISTS usage_daily (user_key TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, "
+           "n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_key, day, kind))")
+        db(f"CREATE TABLE IF NOT EXISTS payments (id {pk}, reference TEXT UNIQUE NOT NULL, user_id INTEGER, email TEXT, "
+           "amount INTEGER, kind TEXT, status TEXT, created TEXT)")
         if not IS_PG:
             print("[warn] DATABASE_URL not set: using a local SQLite file. Accounts and chats are LOST on every Render redeploy.")
     except Exception as e:
@@ -671,7 +710,7 @@ def clean_history(hist):
     return out
 
 
-def generate_answer(q, lang, file_ctx, img_ctx, history):
+def generate_answer(q, lang, file_ctx, img_ctx, history, order=None):
     """Try each AI provider in turn. Returns (answer, sources, provider)."""
     system = build_system(lang)
     has_att = bool(file_ctx or img_ctx)
@@ -679,7 +718,7 @@ def generate_answer(q, lang, file_ctx, img_ctx, history):
     web = {"text": "", "sources": []}
     web_done = False
 
-    for provider in PROVIDER_ORDER:
+    for provider in (order or PROVIDER_ORDER):
         try:
             if provider == "gemini" and gclient:
                 text, srcs = call_gemini(system, history, build_user_text(q, file_ctx, img_ctx))
@@ -765,6 +804,7 @@ select{background:#2a2a2a;color:white;padding:10px 6px;border-radius:10px;border
 .grp{font-size:11px;color:#777;margin:14px 0 4px;text-transform:uppercase}
 .hist{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:8px;cursor:pointer;color:#bbb;font-size:13px;gap:6px}
 .hist:hover,.hist.active{background:#262626;color:white}
+.usage{margin:8px 0;padding:8px;background:#1f1f1f;border:1px solid #2c2c2c;border-radius:8px;font-size:12px;color:#bbb;line-height:1.6}.usage a{color:#FFD700}
 .hist span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .hist i{font-style:normal;color:#777;padding:0 4px}
 .hist i:hover{color:#ff6b6b}
@@ -787,8 +827,10 @@ select{background:#2a2a2a;color:white;padding:10px 6px;border-radius:10px;border
  <a href="/login" style="display:block;padding:10px;background:#FFD700;color:black;text-align:center;border-radius:8px;font-weight:bold;text-decoration:none;margin-bottom:6px">Log in</a>
  <a href="/signup" style="display:block;padding:10px;background:#222;color:white;text-align:center;border-radius:8px;text-decoration:none;border:1px solid #333">Create account</a>
  {% endif %}
+ <div id="usageBox" class="usage"></div>
  <button class="side-btn" onclick="newChat()">＋ New chat</button>
  <div id="histList"></div>
+ <div style="margin-top:auto;padding-top:14px;font-size:11px;color:#666"><a href="/pricing" style="color:#999">Plans</a> · <a href="/terms" style="color:#999">Terms</a> · <a href="/privacy" style="color:#999">Privacy</a></div>
 </div>
 <div id="main">
  <div id="topbar"><button class="btn btn2" onclick="toggleSide()">☰</button><b>MORR AI GH</b></div>
@@ -868,13 +910,14 @@ async function send(){
  try{
   const res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const data=await res.json();$('status').innerText='';
+  if(data.limit){addMsg('ai',fmt(data.answer)+'<br><a href="'+esc(data.upgrade_url)+'">'+(data.upgrade_url==='/signup'?'Create a free account':'⭐ See Premium')+'</a>');busy=false;loadUsage();return;}
   const extra=data.image_url?'<br><img src="'+esc(data.image_url)+'"><br><a href="'+esc(data.download_url||data.image_url)+'">⬇️ Download image</a>':'';
   addMsg('ai',fmt(data.answer||'No answer')+extra+srcHtml(data.sources));
   if(LOGGED_IN&&data.conversation_id){currentConv=data.conversation_id;loadConvs();}
   if(!LOGGED_IN){guestHist.push({role:'user',content:q},{role:'assistant',content:data.answer||''});guestHist=guestHist.slice(-10);}
   if(data.audio_url){const p=$('player');p.style.display='block';p.src=data.audio_url;p.play().catch(()=>{});}
  }catch(e){$('status').innerText='';addMsg('ai','Error: '+esc(e.message));}
- busy=false;
+ busy=false;loadUsage();
 }
 async function handleFile(){
  const f=$('fileInput').files[0];if(!f)return;
@@ -882,9 +925,9 @@ async function handleFile(){
  const fd=new FormData();fd.append('file',f);
  try{
   const data=await (await fetch('/upload',{method:'POST',body:fd})).json();
-  if(data.error){$('status').innerText='';addMsg('ai','⚠️ '+esc(data.error));attachText='';attachImg='';attachName='';return;}
+  if(data.error){$('status').innerText='';addMsg('ai','⚠️ '+esc(data.error)+(data.upgrade_url?'<br><a href="'+esc(data.upgrade_url)+'">'+(data.upgrade_url==='/signup'?'Create a free account':'⭐ See Premium')+'</a>':''));loadUsage();attachText='';attachImg='';attachName='';return;}
   attachText=data.text||'';attachImg=data.image_desc||'';attachName=f.name;
-  $('status').innerText='✅ '+f.name+' attached. Now type your question (or just press send).';
+  $('status').innerText='✅ '+f.name+' attached. Now type your question (or just press send).';loadUsage();
   if(data.preview)addMsg('user','📎 '+esc(f.name)+'<br><img src="'+data.preview+'">');
   else addMsg('user','📎 '+esc(f.name));
  }catch(e){$('status').innerText='⚠️ Upload failed: '+e.message;}
@@ -902,7 +945,7 @@ async function toggleMic(){
     const fd=new FormData();fd.append('audio',new Blob(chunks,{type}),'voice.'+ext);fd.append('language',$('lang').value);
     $('status').innerText='Transcribing...';
     try{const d=await (await fetch('/voice',{method:'POST',body:fd})).json();
-     if(d.text){$('q').value=d.text;$('status').innerText='';send();}else{$('status').innerText='Could not understand the audio, try again.';}
+     if(d.text){$('q').value=d.text;$('status').innerText='';send();}else{$('status').innerText=d.error||'Could not understand the audio, try again.';}
     }catch(e){$('status').innerText='Voice failed: '+e.message;}
     s.getTracks().forEach(t=>t.stop());
    };
@@ -911,7 +954,22 @@ async function toggleMic(){
  }catch(e){$('status').innerText='Mic error: '+e.message;}
 }
 $('q').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
-welcome();loadConvs();
+async function loadUsage(){
+ try{
+  const u=await (await fetch('/api/usage')).json();const L=u.limits,U=u.used;let h='';
+  if(u.plan==='premium'){
+   h='<b>⭐ Premium</b><br>'+(u.days_left!=null?u.days_left+' day(s) left'+(u.auto_renew?' · auto-renews':''):'Unlimited access');
+   h+=(u.days_left!=null&&u.days_left<=3&&!u.auto_renew)?'<br><a href="/pricing">Renew now</a>':'<br><a href="/pricing">Manage plan</a>';
+  }else{
+   h='<b>'+(u.plan==='guest'?'Guest':'Free plan')+'</b> · today<br>Messages '+(U.msg||0)+'/'+L.msg;
+   if(L.img)h+='<br>Images '+(U.img||0)+'/'+L.img;else h+='<br>Images and uploads need a free account';
+   if(L.upload)h+='<br>Uploads '+(U.upload||0)+'/'+L.upload;
+   h+=u.plan==='guest'?'<br><a href="/signup">Create free account</a>':'<br><a href="/pricing">⭐ Go Premium</a>';
+  }
+  $('usageBox').innerHTML=h;
+ }catch(e){}
+}
+welcome();loadConvs();loadUsage();
 </script></body></html>"""
 
 AUTH_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - {{ title }}</title></head>
@@ -946,7 +1004,14 @@ def signup():
         email = (request.form.get("email") or "").lower().strip()
         pw = request.form.get("password") or ""
         err = None
-        if not EMAIL_RE.match(email):
+        ipkey = "ip:" + hash_key(client_ip())
+        try:
+            too_many = get_usage(ipkey).get("signup", 0) >= SIGNUPS_PER_IP
+        except Exception:
+            too_many = False
+        if too_many:
+            err = "Too many new accounts were created from this network today. Please try again tomorrow."
+        elif not EMAIL_RE.match(email):
             err = "Please enter a valid email."
         elif len(pw) < 8:
             err = "Password must be at least 8 characters."
@@ -957,6 +1022,7 @@ def signup():
                 else:
                     uid = db("INSERT INTO users (email, password) VALUES (?, ?)",
                              (email, generate_password_hash(pw)), insert=True)
+                    add_usage(ipkey, "signup")
                     session.clear()
                     session.permanent = True
                     session["user_id"], session["email"] = uid, email
@@ -973,6 +1039,14 @@ def login():
     if request.method == "POST":
         email = (request.form.get("email") or "").lower().strip()
         pw = request.form.get("password") or ""
+        lockkey = "ip:" + hash_key(client_ip())
+        try:
+            locked = get_usage(lockkey).get("login_fail", 0) >= 15
+        except Exception:
+            locked = False
+        if locked:
+            return render_template_string(AUTH_HTML, title="Log in", mode="login",
+                                          error="Too many failed attempts. Please try again tomorrow.", email=email)
         try:
             row = db("SELECT id, password FROM users WHERE email=?", (email,), fetch="one")
         except Exception as e:
@@ -984,6 +1058,7 @@ def login():
             session.permanent = True
             session["user_id"], session["email"] = row[0], email
             return redirect("/")
+        add_usage(lockkey, "login_fail")
         return render_template_string(AUTH_HTML, title="Log in", mode="login",
                                       error="Incorrect email or password.", email=email)
     return render_template_string(AUTH_HTML, title="Log in", mode="login", error=None, email="")
@@ -1032,6 +1107,466 @@ def api_conversation(cid):
 
 
 # ===========================================================================
+# PLANS, DAILY LIMITS AND PAYMENTS (Paystack)
+# ===========================================================================
+def today():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")  # Ghana is on UTC, so this resets at midnight Ghana time
+
+
+def parse_iso(s):
+    try:
+        return datetime.fromisoformat(s) if s else None
+    except Exception:
+        return None
+
+
+def client_ip():
+    return request.remote_addr or "unknown"
+
+
+def hash_key(s):
+    return hashlib.sha256((s + SECRET).encode()).hexdigest()[:20]
+
+
+def usage_key(uid):
+    return f"u:{uid}" if uid else "g:" + hash_key(client_ip())
+
+
+def is_admin():
+    return (session.get("email") or "").lower() in ADMIN_EMAILS
+
+
+def get_premium_until(uid):
+    row = db("SELECT premium_until FROM subscriptions WHERE user_id=?", (uid,), fetch="one")
+    return row[0] if row and row[0] else None
+
+
+def get_plan(uid, email=None):
+    if not uid:
+        return "guest"
+    if email and email.lower() in ADMIN_EMAILS:
+        return "premium"
+    try:
+        until = parse_iso(get_premium_until(uid))
+        if until and until > datetime.now(timezone.utc):
+            return "premium"
+    except Exception as e:
+        print(f"[plan] lookup failed: {str(e)[:150]}")
+    return "free"
+
+
+def premium_info(uid):
+    info = {"days_left": None, "until": None, "auto_renew": False}
+    try:
+        row = db("SELECT premium_until, auto_renew FROM subscriptions WHERE user_id=?", (uid,), fetch="one")
+        if row:
+            until = parse_iso(row[0])
+            now = datetime.now(timezone.utc)
+            if until and until > now:
+                info["days_left"] = max(1, int((until - now).total_seconds() // 86400) + 1)
+                info["until"] = until.strftime("%d %b %Y")
+            info["auto_renew"] = bool(row[1])
+    except Exception as e:
+        print(f"[plan] info failed: {str(e)[:150]}")
+    return info
+
+
+def get_usage(key):
+    rows = db("SELECT kind, n FROM usage_daily WHERE user_key=? AND day=?", (key, today()), fetch="all") or []
+    return {k: n for k, n in rows}
+
+
+def add_usage(key, kind, amount=1):
+    try:
+        db("INSERT INTO usage_daily (user_key, day, kind, n) VALUES (?, ?, ?, ?) "
+           "ON CONFLICT (user_key, day, kind) DO UPDATE SET n = usage_daily.n + ?",
+           (key, today(), kind, amount, amount))
+    except Exception as e:
+        print(f"[usage] could not record: {str(e)[:150]}")
+
+
+def check_limit(uid, email, kind):
+    """Returns (allowed, plan, used, limit). If the database hiccups we let the user through."""
+    plan = get_plan(uid, email)
+    limit = LIMITS[plan][kind]
+    try:
+        used = get_usage(usage_key(uid)).get(kind, 0)
+    except Exception as e:
+        print(f"[usage] lookup failed: {str(e)[:150]}")
+        return True, plan, 0, limit
+    return used < limit, plan, used, limit
+
+
+KIND_NAME = {"msg": "messages", "img": "image generations", "upload": "file uploads", "voice": "voice messages"}
+
+
+def limit_response(plan, kind, limit):
+    name = KIND_NAME[kind]
+    if plan == "guest":
+        if limit == 0:
+            text = f"{name.capitalize()} need a free account. Please sign up or log in to use them."
+        else:
+            text = f"You have used all {limit} guest {name} for today. Create a free account to get more."
+        url = "/signup"
+    elif plan == "free":
+        text = (f"You have used all {limit} free {name} for today. Upgrade to Premium for unlimited use, "
+                "or come back tomorrow (it resets at midnight).")
+        url = "/pricing"
+    else:
+        text = f"You have reached today's fair-use limit for {name}. It resets at midnight, please try again tomorrow."
+        url = "/pricing"
+    return {"answer": text, "error": text, "limit": True, "upgrade_url": url}
+
+
+def set_premium(uid, days, mode="add"):
+    """add: extend from the later of now / current end. floor: make sure it lasts at least `days` from now.
+    end: finish premium immediately."""
+    now = datetime.now(timezone.utc)
+    cur = parse_iso(get_premium_until(uid))
+    if mode == "add":
+        until = (cur if (cur and cur > now) else now) + timedelta(days=days)
+    elif mode == "floor":
+        until = max(cur, now + timedelta(days=days)) if cur else now + timedelta(days=days)
+    else:
+        until = now
+    ts = until.isoformat()
+    db("INSERT INTO subscriptions (user_id, premium_until, updated) VALUES (?, ?, ?) "
+       "ON CONFLICT (user_id) DO UPDATE SET premium_until = ?, updated = ?",
+       (uid, ts, now_iso(), ts, now_iso()))
+    return ts
+
+
+def save_sub_fields(uid, code, token, auto):
+    db("INSERT INTO subscriptions (user_id, sub_code, email_token, auto_renew, updated) VALUES (?, ?, ?, ?, ?) "
+       "ON CONFLICT (user_id) DO UPDATE SET sub_code = ?, email_token = ?, auto_renew = ?, updated = ?",
+       (uid, code, token, 1 if auto else 0, now_iso(), code, token, 1 if auto else 0, now_iso()))
+
+
+def user_id_by_email(email):
+    row = db("SELECT id FROM users WHERE email=?", ((email or "").lower().strip(),), fetch="one")
+    return row[0] if row else None
+
+
+def paystack(method, path, **kw):
+    if not PAYSTACK_SECRET:
+        raise RuntimeError("Paystack is not configured")
+    r = requests.request(method, "https://api.paystack.co" + path,
+                         headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"}, timeout=20, **kw)
+    try:
+        j = r.json()
+    except Exception:
+        j = {}
+    if r.status_code >= 400 or not j.get("status"):
+        raise RuntimeError(j.get("message") or f"HTTP {r.status_code}")
+    return j["data"]
+
+
+def apply_paystack_payment(data):
+    """data is a Paystack transaction object that has been verified (by API call or signed webhook).
+    Safe to call more than once for the same payment. Returns (ok, message)."""
+    if data.get("status") != "success":
+        return False, "payment not successful"
+    if (data.get("currency") or "GHS").upper() != "GHS" or int(data.get("amount") or 0) < int(round(PRICE_GHS * 100)):
+        print(f"[pay] ignoring payment with wrong amount/currency: {data.get('amount')} {data.get('currency')}")
+        return False, "wrong amount"
+    ref = data.get("reference")
+    if not ref:
+        return False, "no reference"
+    meta = data.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    email = ((data.get("customer") or {}).get("email") or "").lower()
+    uid = None
+    try:
+        uid = int(meta.get("user_id")) if meta.get("user_id") else None
+    except (TypeError, ValueError):
+        uid = None
+    if uid and not db("SELECT id FROM users WHERE id=?", (uid,), fetch="one"):
+        uid = None
+    if not uid:
+        uid = user_id_by_email(email)
+    if not uid:
+        print(f"[pay] no user found for payment {ref}")
+        return False, "user not found"
+    if db("SELECT id FROM payments WHERE reference=?", (ref,), fetch="one"):
+        return True, "already processed"
+    is_sub = bool(data.get("plan")) or meta.get("kind") == "subscription"
+    try:
+        db("INSERT INTO payments (reference, user_id, email, amount, kind, status, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
+           (ref, uid, email, int(data.get("amount") or 0), "subscription" if is_sub else "onetime", "success", now_iso()))
+    except Exception:
+        if db("SELECT id FROM payments WHERE reference=?", (ref,), fetch="one"):
+            return True, "already processed"
+        raise
+    if is_sub:
+        set_premium(uid, DAYS_SUBSCRIPTION, "floor")
+    else:
+        set_premium(uid, DAYS_ONE_TIME, "add")
+    print(f"[pay] premium activated for user {uid} ({'subscription' if is_sub else 'one-time'})")
+    return True, "activated"
+
+
+@app.route("/api/usage")
+def api_usage():
+    uid, email = current_user(), session.get("email")
+    plan = get_plan(uid, email)
+    try:
+        used = get_usage(usage_key(uid))
+    except Exception:
+        used = {}
+    info = premium_info(uid) if uid else {"days_left": None, "until": None, "auto_renew": False}
+    if plan == "premium" and (email or "").lower() in ADMIN_EMAILS and not info["days_left"]:
+        info["days_left"] = None
+    return jsonify({"plan": plan, "used": used, "limits": LIMITS[plan], **info})
+
+
+@app.route("/pricing")
+def pricing():
+    uid, email = current_user(), session.get("email")
+    plan = get_plan(uid, email)
+    info = premium_info(uid) if uid else {"days_left": None, "until": None, "auto_renew": False}
+    return render_template_string(
+        PRICING_HTML, plan=plan, logged_in=bool(uid), email=email, price=PRICE_GHS, limits=LIMITS,
+        free_mb=MAX_UPLOAD_MB["free"], prem_mb=MAX_UPLOAD_MB["premium"], info=info,
+        pay_ready=bool(PAYSTACK_SECRET), plan_ready=bool(PAYSTACK_PLAN),
+        status=request.args.get("status"), error=request.args.get("error"))
+
+
+@app.route("/billing/checkout", methods=["POST"])
+def billing_checkout():
+    uid = current_user()
+    if not uid:
+        return redirect("/login")
+    kind = request.form.get("kind")
+    if kind not in ("subscription", "onetime"):
+        return redirect("/pricing?error=Please choose a payment option.")
+    if not PAYSTACK_SECRET or (kind == "subscription" and not PAYSTACK_PLAN):
+        return redirect("/pricing?error=Payments are not switched on yet. Please try again later.")
+    base = SITE_URL or request.host_url.rstrip("/")
+    payload = {"email": session["email"], "amount": int(round(PRICE_GHS * 100)), "currency": "GHS",
+               "callback_url": base + "/billing/callback", "metadata": {"user_id": uid, "kind": kind}}
+    if kind == "subscription":
+        payload["plan"] = PAYSTACK_PLAN
+        payload["channels"] = ["card"]
+    else:
+        payload["channels"] = ["mobile_money", "card"]
+    try:
+        data = paystack("POST", "/transaction/initialize", json=payload)
+        return redirect(data["authorization_url"])
+    except Exception as e:
+        print(f"[pay] initialize failed: {str(e)[:200]}")
+        return redirect("/pricing?error=We could not start the payment. Please try again.")
+
+
+@app.route("/billing/callback")
+def billing_callback():
+    ref = request.args.get("reference") or request.args.get("trxref")
+    if not ref:
+        return redirect("/pricing")
+    try:
+        data = paystack("GET", "/transaction/verify/" + urllib.parse.quote(ref, safe=""))
+        ok, msg = apply_paystack_payment(data)
+        return redirect("/pricing?status=success" if ok else "/pricing?status=failed")
+    except Exception as e:
+        print(f"[pay] verify failed: {str(e)[:200]}")
+        return redirect("/pricing?status=failed")
+
+
+@app.route("/paystack/webhook", methods=["POST"])
+def paystack_webhook():
+    raw = request.get_data()
+    sig = request.headers.get("x-paystack-signature", "")
+    if not PAYSTACK_SECRET:
+        return "not configured", 503
+    expected = hmac.new(PAYSTACK_SECRET.encode(), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return "bad signature", 401
+    try:
+        event = json.loads(raw)
+        typ, data = event.get("event"), event.get("data") or {}
+        if typ == "charge.success":
+            apply_paystack_payment(data)
+        elif typ in ("subscription.create", "subscription.disable", "subscription.not_renew"):
+            uid = user_id_by_email((data.get("customer") or {}).get("email"))
+            if uid:
+                if typ == "subscription.create":
+                    save_sub_fields(uid, data.get("subscription_code"), data.get("email_token"), True)
+                else:
+                    row = db("SELECT sub_code, email_token FROM subscriptions WHERE user_id=?", (uid,), fetch="one")
+                    save_sub_fields(uid, row[0] if row else None, row[1] if row else None, False)
+    except Exception as e:
+        print(f"[pay] webhook failed: {str(e)[:200]}")
+        return "error", 500  # Paystack will retry
+    return "ok", 200
+
+
+@app.route("/billing/cancel", methods=["POST"])
+def billing_cancel():
+    uid = current_user()
+    if not uid:
+        return redirect("/login")
+    try:
+        row = db("SELECT sub_code, email_token FROM subscriptions WHERE user_id=?", (uid,), fetch="one")
+        if not row or not row[0] or not row[1]:
+            return redirect("/pricing?error=No active card subscription was found on your account.")
+        paystack("POST", "/subscription/disable", json={"code": row[0], "token": row[1]})
+        save_sub_fields(uid, row[0], row[1], False)
+        return redirect("/pricing?status=cancelled")
+    except Exception as e:
+        print(f"[pay] cancel failed: {str(e)[:200]}")
+        return redirect("/pricing?error=We could not cancel right now. Please try again.")
+
+
+# ---------------------------------------------------------------------------
+# ADMIN (only emails listed in ADMIN_EMAILS)
+# ---------------------------------------------------------------------------
+@app.route("/admin")
+def admin_page():
+    if not is_admin():
+        return "Not allowed", 403
+    users_total = db("SELECT COUNT(*) FROM users", fetch="one")[0]
+    now = datetime.now(timezone.utc)
+    prem = 0
+    for (u,) in db("SELECT premium_until FROM subscriptions", fetch="all") or []:
+        d = parse_iso(u)
+        if d and d > now:
+            prem += 1
+    msgs = db("SELECT COALESCE(SUM(n), 0) FROM usage_daily WHERE day=? AND kind='msg'", (today(),), fetch="one")[0]
+    revenue = db("SELECT COALESCE(SUM(amount), 0) FROM payments", fetch="one")[0]
+    pays = db("SELECT email, amount, kind, created FROM payments ORDER BY id DESC LIMIT 15", fetch="all") or []
+    return render_template_string(ADMIN_HTML, users_total=users_total, prem=prem, msgs=msgs,
+                                  revenue=revenue / 100.0, pays=pays, msg=request.args.get("msg"))
+
+
+@app.route("/admin/grant", methods=["POST"])
+def admin_grant():
+    if not is_admin():
+        return "Not allowed", 403
+    email = (request.form.get("email") or "").lower().strip()
+    try:
+        days = max(1, min(int(request.form.get("days") or 30), 3650))
+    except ValueError:
+        days = 30
+    uid = user_id_by_email(email)
+    if not uid:
+        return redirect("/admin?msg=No user with that email.")
+    set_premium(uid, days, "add")
+    return redirect(f"/admin?msg=Gave {days} days of Premium to {email}.")
+
+
+@app.route("/admin/revoke", methods=["POST"])
+def admin_revoke():
+    if not is_admin():
+        return "Not allowed", 403
+    email = (request.form.get("email") or "").lower().strip()
+    uid = user_id_by_email(email)
+    if not uid:
+        return redirect("/admin?msg=No user with that email.")
+    set_premium(uid, 0, "end")
+    return redirect(f"/admin?msg=Premium ended for {email}.")
+
+
+# ---------------------------------------------------------------------------
+# PRICING / ADMIN / LEGAL PAGES
+# ---------------------------------------------------------------------------
+PAGE_STYLE = ("body{margin:0;background:#0a0a0a;color:white;font-family:system-ui,sans-serif;padding:20px}"
+              ".wrap{max-width:860px;margin:0 auto}a{color:#FFD700}h1{color:#FFD700;margin:6px 0}"
+              ".cards{display:flex;gap:14px;flex-wrap:wrap;margin-top:16px}"
+              ".card{flex:1;min-width:260px;background:#171717;border:1px solid #333;border-radius:14px;padding:18px}"
+              ".card.prem{border-color:#FFD700}.price{font-size:28px;color:#FFD700;font-weight:bold}"
+              "ul{padding-left:18px;line-height:1.8;color:#ddd}"
+              "button{width:100%;padding:12px;border-radius:10px;border:none;background:#FFD700;color:black;font-weight:bold;"
+              "font-size:15px;cursor:pointer;margin-top:8px}button.alt{background:#333;color:white}button:disabled{opacity:.4}"
+              ".ok{background:#12301a;border:1px solid #2a7a3a;padding:10px;border-radius:10px;margin:10px 0}"
+              ".err{background:#3a1515;border:1px solid #7a2a2a;padding:10px;border-radius:10px;margin:10px 0}"
+              "table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #2a2a2a;text-align:left;font-size:14px}"
+              "input{padding:10px;border-radius:8px;border:1px solid #333;background:#222;color:white;font-size:15px}")
+
+PRICING_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - Plans</title>
+<style>""" + PAGE_STYLE + r"""</style></head><body><div class="wrap">
+<a href="/">← Back to chat</a>
+<h1>MORR AI GH Plans</h1>
+{% if status == 'success' %}<div class="ok">🎉 Payment received. Premium is now active. Thank you!</div>
+{% elif status == 'failed' %}<div class="err">We could not confirm your payment yet. If you were charged, Premium will switch on automatically in a few minutes. If not, please contact support.</div>
+{% elif status == 'cancelled' %}<div class="ok">Auto-renewal cancelled. You keep Premium until the end of the period you paid for.</div>{% endif %}
+{% if error %}<div class="err">{{ error }}</div>{% endif %}
+{% if plan == 'premium' %}<div class="ok">⭐ You are on Premium{% if info.until %} until {{ info.until }}{% if info.auto_renew %} (auto-renews){% endif %}{% endif %}.</div>{% endif %}
+<div class="cards">
+ <div class="card"><h2>Free</h2><div class="price">GHS 0</div>
+  <ul><li>{{ limits.free.msg }} messages a day</li><li>{{ limits.free.img }} image generations a day</li>
+  <li>{{ limits.free.upload }} file or photo uploads a day (up to {{ free_mb }} MB)</li><li>Saved chat history</li></ul>
+  {% if not logged_in %}<a href="/signup"><button class="alt" type="button">Create free account</button></a>{% endif %}</div>
+ <div class="card prem"><h2>⭐ Premium</h2><div class="price">GHS {{ '%.2f'|format(price) }} <span style="font-size:14px;color:#aaa">/ month</span></div>
+  <ul><li>Unlimited messages*</li><li>Unlimited image generations*</li><li>Unlimited file and photo uploads* (up to {{ prem_mb }} MB)</li>
+  <li>Priority access to our best AI model</li><li>Saved chat history</li></ul>
+  <div style="font-size:12px;color:#888">*Fair use applies.</div>
+  {% if not logged_in %}<a href="/login"><button type="button">Log in to upgrade</button></a>
+  {% else %}
+  <form method="POST" action="/billing/checkout"><input type="hidden" name="kind" value="subscription">
+   <button {% if not (pay_ready and plan_ready) %}disabled{% endif %}>Subscribe monthly with card (auto-renews)</button></form>
+  <form method="POST" action="/billing/checkout"><input type="hidden" name="kind" value="onetime">
+   <button class="alt" {% if not pay_ready %}disabled{% endif %}>Pay for 30 days (Mobile Money or card)</button></form>
+  {% if plan == 'premium' and info.auto_renew %}<form method="POST" action="/billing/cancel"><button class="alt" onclick="return confirm('Stop automatic renewal?')">Cancel auto-renewal</button></form>{% endif %}
+  {% if not pay_ready %}<div style="font-size:12px;color:#c88;margin-top:8px">Payments are not switched on yet.</div>{% endif %}
+  {% endif %}</div>
+</div>
+<p style="color:#888;font-size:13px;margin-top:20px">Payments are processed securely by Paystack. We never see or store your card or Mobile Money details.
+<a href="/terms">Terms</a> · <a href="/privacy">Privacy</a></p>
+</div></body></html>"""
+
+ADMIN_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - Admin</title>
+<style>""" + PAGE_STYLE + r"""</style></head><body><div class="wrap">
+<a href="/">← Back to chat</a><h1>Admin</h1>
+{% if msg %}<div class="ok">{{ msg }}</div>{% endif %}
+<div class="cards"><div class="card"><div>Users</div><div class="price">{{ users_total }}</div></div>
+<div class="card"><div>Active Premium</div><div class="price">{{ prem }}</div></div>
+<div class="card"><div>Messages today</div><div class="price">{{ msgs }}</div></div>
+<div class="card"><div>Total received (GHS)</div><div class="price">{{ '%.2f'|format(revenue) }}</div></div></div>
+<h3>Give or end Premium</h3>
+<form method="POST" action="/admin/grant" style="display:flex;gap:8px;flex-wrap:wrap"><input name="email" type="email" placeholder="User email" required>
+<input name="days" type="number" value="30" min="1" style="width:90px"><button style="width:auto;padding:10px 16px">Give Premium</button></form>
+<form method="POST" action="/admin/revoke" style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap"><input name="email" type="email" placeholder="User email" required>
+<button class="alt" style="width:auto;padding:10px 16px">End Premium</button></form>
+<h3>Recent payments</h3><table><tr><th>Email</th><th>GHS</th><th>Type</th><th>When</th></tr>
+{% for e, a, k, c in pays %}<tr><td>{{ e }}</td><td>{{ '%.2f'|format(a / 100) }}</td><td>{{ k }}</td><td>{{ c[:16] }}</td></tr>{% endfor %}</table>
+</div></body></html>"""
+
+LEGAL_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MORR AI GH - {{ title }}</title>
+<style>""" + PAGE_STYLE + r"""</style></head><body><div class="wrap"><a href="/">← Back to chat</a><h1>{{ title }}</h1>
+<div class="err">DRAFT TEMPLATE. Replace everything in [square brackets] and have it reviewed by a qualified lawyer before you rely on it.</div>
+{% for h, t in sections %}<h3>{{ h }}</h3><p style="color:#ddd;line-height:1.7">{{ t }}</p>{% endfor %}
+</div></body></html>"""
+
+TERMS = [
+    ("The service", "MORR AI GH is an AI chat assistant that can answer questions, read files and photos and generate images. AI answers can be wrong, so check important information before relying on it."),
+    ("Accounts", "You must give a real email address and keep your password private. You are responsible for activity on your account."),
+    ("Acceptable use", "Do not use MORR AI GH for anything illegal, abusive, harmful or deceptive, or to attack or overload the service. We may limit or close accounts that break these rules."),
+    ("Plans and limits", "Free accounts have daily limits that reset at midnight (Ghana time). Premium is GHS 53.00 per month and is described as unlimited, subject to fair use."),
+    ("Billing", "Card subscriptions renew automatically every month until you cancel on the Plans page. Mobile Money and one-off payments give 30 days of Premium and do not renew by themselves. Payments are handled by Paystack. [Refund policy: write yours here.]"),
+    ("Changes and ending", "We may change features, prices or these terms, and will tell you about important changes. You can stop using the service at any time. [Add how users can delete their account.]"),
+    ("Contact", "[Your business name, address and support email.]"),
+]
+PRIVACY = [
+    ("What we collect", "Your email address, a scrambled (hashed) version of your password, your chats, files and images you upload for processing, and records of your payments (reference, amount, date). We do not see or store your card or Mobile Money details; Paystack handles those."),
+    ("How we use it", "To run your account, answer your questions, save your chat history, enforce plan limits and process payments."),
+    ("Who we share it with", "Your messages, and any files or images you send, are processed by our AI and search providers (for example Google Gemini and Groq) and our hosting and database providers. Payments are processed by Paystack. [List any others you add.]"),
+    ("How long we keep it", "[Say how long you keep chats and account data, and how users can ask for deletion.]"),
+    ("Your rights", "[Explain how users can access, correct or delete their data, in line with Ghana's Data Protection Act. Ask a lawyer to check this and whether you must register with the Data Protection Commission.]"),
+    ("Contact", "[Your support email.]"),
+]
+
+
+@app.route("/terms")
+def terms_page():
+    return render_template_string(LEGAL_HTML, title="Terms of Service", sections=TERMS)
+
+
+@app.route("/privacy")
+def privacy_page():
+    return render_template_string(LEGAL_HTML, title="Privacy Policy", sections=PRIVACY)
+
+
+# ===========================================================================
 # ASK
 # ===========================================================================
 @app.route("/ask", methods=["POST"])
@@ -1050,6 +1585,12 @@ def ask_route():
         return jsonify({"answer": "Please type a question."}), 400
 
     uid = current_user()
+    email_now = session.get("email")
+    is_img = not (file_ctx or img_ctx) and wants_image(q)
+    kind = "img" if is_img else "msg"
+    allowed, plan, used, limit = check_limit(uid, email_now, kind)
+    if not allowed:
+        return jsonify(limit_response(plan, kind, limit)), 429
     conv_id = d.get("conversation_id")
     history = []
     try:
@@ -1067,15 +1608,18 @@ def ask_route():
         conv_id = None
 
     image_name = None
-    if not (file_ctx or img_ctx) and wants_image(q):
+    if is_img:
         ans, sources, provider, image_name = make_image_answer(q)
     else:
         try:
-            ans, sources, provider = generate_answer(q, lang, file_ctx, img_ctx, history)
+            ans, sources, provider = generate_answer(q, lang, file_ctx, img_ctx, history,
+                                                     PROVIDER_ORDER if plan == "premium" else FREE_PROVIDER_ORDER)
         except Exception as e:
             print(f"[ask] unexpected failure: {e}")
             return jsonify({"answer": "Something went wrong on my side. Please try again."}), 500
     print(f"[ask] answered by {provider}")
+    if provider not in ("none", "image-failed"):
+        add_usage(usage_key(uid), kind)
 
     if uid:
         try:
@@ -1112,6 +1656,16 @@ def upload():
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify({"error": "No file received."}), 400
+    uid_u = current_user()
+    allowed, plan_u, used_u, limit_u = check_limit(uid_u, session.get("email"), "upload")
+    if not allowed:
+        return jsonify(limit_response(plan_u, "upload", limit_u)), 429
+    max_mb = MAX_UPLOAD_MB["premium" if plan_u == "premium" else "free"]
+    if request.content_length and request.content_length > max_mb * 1024 * 1024:
+        msg = f"That file is too big for your plan (max {max_mb} MB)."
+        if plan_u != "premium":
+            msg += f" Premium allows files up to {MAX_UPLOAD_MB['premium']} MB."
+        return jsonify({"error": msg, "upgrade_url": "/pricing" if plan_u != "premium" else None}), 413
     safe = secure_filename(f.filename) or "upload"
     ext = os.path.splitext(safe.lower())[1]
     tmp = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex[:8]}_{safe}")
@@ -1171,6 +1725,7 @@ def upload():
             os.remove(tmp)
         except OSError:
             pass
+    add_usage(usage_key(uid_u), "upload")
     return jsonify({"text": text, "image_desc": img_desc, "preview": preview})
 
 
@@ -1179,6 +1734,11 @@ def voice():
     f = request.files.get("audio")
     if not f:
         return jsonify({"text": ""})
+    uid_v = current_user()
+    allowed, plan_v, used_v, limit_v = check_limit(uid_v, session.get("email"), "voice")
+    if not allowed:
+        r = limit_response(plan_v, "voice", limit_v)
+        return jsonify({"text": "", "error": r["error"], "upgrade_url": r["upgrade_url"]}), 429
     data = f.read()
     mime = (f.mimetype or "audio/webm").split(";")[0]
     if not mime.startswith("audio/"):
@@ -1193,6 +1753,8 @@ def voice():
             txt = resp.text or ""
     except Exception as e:
         print(f"[voice] failed: {str(e)[:300]}")
+    if txt.strip():
+        add_usage(usage_key(uid_v), "voice")
     return jsonify({"text": txt.strip()})
 
 
