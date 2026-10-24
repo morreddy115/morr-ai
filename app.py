@@ -1,4 +1,4 @@
-import os, re, io, base64, hmac, hashlib, json, uuid, time, secrets, sqlite3, socket, ipaddress, tempfile, urllib.parse
+import os, re, io, base64, hmac, hashlib, json, uuid, time, secrets, sqlite3, socket, ipaddress, tempfile, urllib.parse, csv
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -14,11 +14,15 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 #   SECRET_KEY         required: any long random text (keeps logins safe)
 #   DATABASE_URL       recommended: Postgres link (Neon/Supabase) so accounts survive redeploys
 #   GEMINI_API_KEY     AI provider 1 (also reads images, PDFs and voice)
-#   GROQ_API_KEY       AI provider 2
+#   GROQ_API_KEY       AI provider 2 (also does voice transcription with Whisper)
 #   TAVILY_API_KEY     optional: best live web search
 #   OPENROUTER_API_KEY + OPENROUTER_MODEL   optional: AI provider 3
-#   GEMINI_MODEL / GROQ_MODEL   optional: force a model name (otherwise auto-detected)
+#   GEMINI_MODEL / GROQ_MODEL / GROQ_WHISPER_MODEL   optional: force a model name (otherwise auto-detected)
 #   PROVIDER_ORDER     optional, default "gemini,groq,openrouter"
+#   UNSPLASH_ACCESS_KEY / PEXELS_API_KEY / PIXABAY_API_KEY   optional: free keys for real photo search
+#
+# Render start command (important, stops "worker timeout" errors on slow AI calls):
+#   gunicorn app:app --workers 1 --threads 8 --timeout 120
 # ===========================================================================
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -40,6 +44,9 @@ GROQ_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 TAVILY_KEY = (os.getenv("TAVILY_API_KEY") or "").strip()
 OPENROUTER_KEY = (os.getenv("OPENROUTER_API_KEY") or "").strip()
 OPENROUTER_MODEL = (os.getenv("OPENROUTER_MODEL") or "").strip()
+UNSPLASH_KEY = (os.getenv("UNSPLASH_ACCESS_KEY") or "").strip()
+PEXELS_KEY = (os.getenv("PEXELS_API_KEY") or "").strip()
+PIXABAY_KEY = (os.getenv("PIXABAY_API_KEY") or "").strip()
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "morr.db")
 PROVIDER_ORDER = [p.strip() for p in os.getenv("PROVIDER_ORDER", "gemini,groq,openrouter").split(",") if p.strip()]
@@ -67,11 +74,13 @@ SIGNUPS_PER_IP = _int_env("SIGNUPS_PER_IP", 3)
 DAYS_ONE_TIME = 30       # Mobile Money / one-off payment
 DAYS_SUBSCRIPTION = 32   # card subscription (a couple of spare days so a late renewal never cuts access)
 LIMITS = {
-    "guest": {"msg": _int_env("GUEST_MSGS", 5), "img": 0, "upload": 0, "voice": 0},
+    "guest": {"msg": _int_env("GUEST_MSGS", 5), "img": 0, "upload": 0, "voice": 0, "file": 0},
     "free": {"msg": _int_env("FREE_MSGS", 20), "img": _int_env("FREE_IMGS", 3),
-             "upload": _int_env("FREE_UPLOADS", 3), "voice": _int_env("FREE_VOICE", 20)},
+             "upload": _int_env("FREE_UPLOADS", 3), "voice": _int_env("FREE_VOICE", 20),
+             "file": _int_env("FREE_FILES", 3)},
     "premium": {"msg": _int_env("PREMIUM_MSGS", 500), "img": _int_env("PREMIUM_IMGS", 50),
-                "upload": _int_env("PREMIUM_UPLOADS", 50), "voice": _int_env("PREMIUM_VOICE", 200)},
+                "upload": _int_env("PREMIUM_UPLOADS", 50), "voice": _int_env("PREMIUM_VOICE", 200),
+                "file": _int_env("PREMIUM_FILES", 50)},
 }
 MAX_UPLOAD_MB = {"free": _int_env("FREE_UPLOAD_MB", 5), "premium": _int_env("PREMIUM_UPLOAD_MB", 20)}
 
@@ -89,6 +98,7 @@ GENERATED_DIR = os.path.join(tempfile.gettempdir(), "morr_ai_generated")
 os.makedirs(GENERATED_DIR, exist_ok=True)
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+WIKI_UA = {"User-Agent": "MORR AI GH/2.0 (Ghana AI assistant; image lookup)"}
 
 
 def now_iso():
@@ -104,6 +114,22 @@ def cleanup_old_files(max_age=6 * 3600):
                 os.remove(p)
     except Exception:
         pass
+
+
+# --- Cleans AI answers: removes leaked citation markers like 【1†L1-L4】 and odd invisible/narrow spaces ---
+CITE_RE = re.compile(r"【[^】]*】")
+_ODD_SPACES = dict.fromkeys(map(ord, "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"), " ")
+_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u2060\ufeff"), None)
+
+
+def clean_answer(text):
+    if not text:
+        return text
+    text = CITE_RE.sub("", text)
+    text = text.translate(_ODD_SPACES).translate(_ZERO_WIDTH)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"(?<=\S) +([.,])(?=\s|$)", r"\1", text)
+    return text.strip()
 
 
 # ===========================================================================
@@ -417,11 +443,11 @@ def call_gemini(system, history, user_text):
     return resp.text, gemini_sources(resp)
 
 
-def _chat_post(url, key, model, messages, extra_headers=None):
+def _chat_post(url, key, model, messages, extra_headers=None, max_tokens=1200):
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     headers.update(extra_headers or {})
-    r = requests.post(url, headers=headers, timeout=45,
-                      json={"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 1200})
+    r = requests.post(url, headers=headers, timeout=45 if max_tokens <= 1500 else 90,
+                      json={"model": model, "messages": messages, "temperature": 0.7, "max_tokens": max_tokens})
     if r.status_code != 200:
         raise RuntimeError(f"{r.status_code} {r.text[:300]}")
     return r.json()["choices"][0]["message"]["content"]
@@ -449,7 +475,7 @@ def discover_groq_model():
         return None
 
 
-def call_groq(system, history, user_text):
+def call_groq(system, history, user_text, max_tokens=1200):
     messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_text}]
     forced = os.getenv("GROQ_MODEL")
     for attempt in range(2):
@@ -458,7 +484,8 @@ def call_groq(system, history, user_text):
             raise RuntimeError("No Groq model available")
         MODEL_CACHE["groq"] = model
         try:
-            return _chat_post("https://api.groq.com/openai/v1/chat/completions", GROQ_KEY, model, messages)
+            return _chat_post("https://api.groq.com/openai/v1/chat/completions", GROQ_KEY, model, messages,
+                              max_tokens=max_tokens)
         except Exception as e:
             s = str(e).lower()
             if attempt == 0 and any(x in s for x in ("model_not_found", "decommissioned", "does not exist", "404")):
@@ -468,10 +495,55 @@ def call_groq(system, history, user_text):
             raise
 
 
-def call_openrouter(system, history, user_text):
+def call_openrouter(system, history, user_text, max_tokens=1200):
     messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_text}]
     return _chat_post("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_KEY, OPENROUTER_MODEL,
-                      messages, {"X-Title": "MORR AI GH"})
+                      messages, {"X-Title": "MORR AI GH"}, max_tokens)
+
+
+# ===========================================================================
+# VOICE TRANSCRIPTION (Groq Whisper first: it accepts webm/mp4/ogg recordings from phones and browsers)
+# ===========================================================================
+def discover_groq_whisper():
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models",
+                         headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=10)
+        r.raise_for_status()
+        ids = [m.get("id", "") for m in r.json().get("data", [])
+               if "whisper" in m.get("id", "").lower() and m.get("active") is not False]
+        for pref in ("whisper-large-v3-turbo", "whisper-large-v3"):
+            if pref in ids:
+                print(f"[groq] auto-detected whisper model: {pref}")
+                return pref
+        if ids:
+            print(f"[groq] auto-detected whisper model: {ids[0]}")
+            return ids[0]
+    except Exception as e:
+        print(f"[groq] whisper discovery failed: {str(e)[:200]}")
+    return None
+
+
+def groq_transcribe(data, filename, mime, lang_hint=None):
+    if not GROQ_KEY:
+        raise RuntimeError("Groq is not configured")
+    forced = os.getenv("GROQ_WHISPER_MODEL")
+    for attempt in range(2):
+        model = MODEL_CACHE.get("groq_whisper") or forced or discover_groq_whisper() or "whisper-large-v3-turbo"
+        MODEL_CACHE["groq_whisper"] = model
+        form = {"model": model, "response_format": "json", "temperature": "0"}
+        if lang_hint:
+            form["language"] = lang_hint
+        r = requests.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                          headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                          files={"file": (filename, data, mime)}, data=form, timeout=60)
+        if r.status_code == 200:
+            return (r.json().get("text") or "").strip()
+        low = r.text[:300].lower()
+        if attempt == 0 and any(x in low for x in ("model_not_found", "decommissioned", "does not exist")):
+            MODEL_CACHE.pop("groq_whisper", None)
+            forced = None
+            continue
+        raise RuntimeError(f"{r.status_code} {r.text[:200]}")
 
 
 # ===========================================================================
@@ -543,12 +615,20 @@ def describe_image(jpeg_bytes):
 
 
 # ===========================================================================
-# IMAGE GENERATION (Pollinations needs no key and has no quota; Gemini image models as backup)
+# IMAGE REQUESTS: real photo search (Wikipedia + optional stock sites) or AI art (Pollinations / Gemini)
 # ===========================================================================
 IMG_GEN_RE = re.compile(
     r"\b(?:generate|create|make|draw|design|paint|produce|render)\b[^.?!\n]{0,40}?\b"
     r"(?:image|images|picture|pictures|photo|pic|logo|poster|illustration|wallpaper|drawing|painting|flyer|banner|icon|cartoon|artwork)\b"
+    r"|\b(?:show me|give me|send me|find me|get me)\b[^.?!\n]{0,20}?\b(?:image|images|picture|pictures|photo|photos|pic|pics)\b"
+    r"|\b(?:image|picture|photo|pic)s? of\b"
     r"|^\s*(?:/image|/imagine|imagine|draw)\b", re.I)
+ART_WORDS = re.compile(r"\b(draw|paint|sketch|cartoon|anime|logo|poster|flyer|banner|icon|illustration|wallpaper|artwork|"
+                       r"imagine|futuristic|fantasy|3d|abstract|watercolou?r|pixel art)\b", re.I)
+PRONOUN_RE = re.compile(r"\b(his|her|hers|their|theirs|him|them|its|it)\b", re.I)
+ATTACH_REF_RE = re.compile(
+    r"\b(?:i\s+(?:just\s+)?(?:uploaded|attached|sent)|(?:uploaded|attached)\s+(?:picture|image|photo|file|pdf|document|screenshot)"
+    r"|(?:this|the|my)\s+(?:picture|image|photo|screenshot|pdf|document|file)\s+(?:above|here))\b", re.I)
 
 
 def wants_image(q):
@@ -558,8 +638,9 @@ def wants_image(q):
 
 
 def clean_image_prompt(q):
-    s = re.sub(r"^\s*(?:please\s+|pls\s+|can you\s+|could you\s+)*(?:/image|/imagine|imagine|generate|create|make|draw|design|paint|produce)"
-               r"\s+(?:me\s+)?(?:an?\s+|the\s+)?(?:ai\s+)?(?:image|picture|photo|pic|logo|poster|illustration|drawing|painting)?"
+    s = re.sub(r"^\s*(?:(?:please|pls|can you|could you)\s+)*"
+               r"(?:(?:/image|/imagine|imagine|generate|create|make|draw|design|paint|produce|show me|give me|send me|find me|get me)\s+)?"
+               r"(?:me\s+)?(?:an?\s+|the\s+)?(?:ai\s+)?(?:images?|pictures?|photos?|pics?|logo|poster|illustration|drawing|painting)?"
                r"\s*(?:of|for|showing|with)?\s*", "", q, flags=re.I).strip(" .:-")
     return s or q
 
@@ -580,15 +661,142 @@ def quick_llm(system, user):
     return ""
 
 
+def plan_image(q, history):
+    """Decide: show a REAL photo (searched online) or draw AI art. Uses the chat history so
+    'his picture' becomes the real name. Returns {"mode": photo|art|clarify, "query": str, "person": bool}"""
+    base = clean_image_prompt(q)
+    ctx = "\n".join(f"{h['role']}: {h['content'][:300]}" for h in (history or [])[-4:])
+    system = (
+        "You decide how to fulfil an image request. Reply with ONLY one JSON object: "
+        '{"mode":"photo" or "art","query":"...","person":true or false}. '
+        'Use "photo" when the user wants a real, existing person, place, animal, object, event, product or landmark. '
+        "Use the earlier chat to replace words like his/her/it/that with the real name. For photo, query is a short "
+        "search phrase with the full name plus a disambiguating word, for example 'Ibrahim Traoré Burkina Faso' or "
+        "'Independence Arch Accra'. Set person to true when the photo is of a real named human. "
+        'Use "art" when they want something invented, artistic or hypothetical (drawings, logos, posters, cartoons, '
+        "fantasy or imaginary scenes). For art, query is one vivid English image prompt of at most 50 words.")
+    raw = quick_llm(system, f"Earlier chat:\n{ctx or '(none)'}\n\nImage request: {q}")
+    m = re.search(r"\{.*\}", raw or "", re.S)
+    if m:
+        try:
+            j = json.loads(m.group(0))
+            mode = str(j.get("mode", "")).lower().strip()
+            query = str(j.get("query", "")).strip().strip('"')
+            if mode in ("photo", "art") and 2 < len(query) < 600:
+                return {"mode": mode, "query": query, "person": bool(j.get("person"))}
+        except Exception as e:
+            print(f"[image] planner JSON failed: {str(e)[:120]}")
+    # Fallback when no AI is reachable
+    if ART_WORDS.search(q):
+        return {"mode": "art", "query": base, "person": False}
+    if PRONOUN_RE.search(base) and len(base.split()) <= 4:
+        return {"mode": "clarify", "query": base, "person": False}
+    return {"mode": "photo", "query": base, "person": False}
+
+
 def _save_generated(data):
-    from PIL import Image
+    from PIL import Image, ImageOps
     im = Image.open(io.BytesIO(data))
     im.load()
-    im = im.convert("RGB")
+    im = ImageOps.exif_transpose(im).convert("RGB")
+    im.thumbnail((1280, 1280))
     cleanup_old_files()
     name = f"gen_{uuid.uuid4().hex[:8]}.jpg"
     im.save(os.path.join(GENERATED_DIR, name), "JPEG", quality=90)
     return name
+
+
+TRUSTED_IMG_HOSTS = ("wikimedia.org", "wikipedia.org", "images.unsplash.com", "images.pexels.com", "pixabay.com")
+
+
+def _download_image(url, max_bytes=6 * 1024 * 1024):
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in TRUSTED_IMG_HOSTS):
+        raise RuntimeError("untrusted image host")
+    r = requests.get(url, headers=WIKI_UA, timeout=20, stream=True)
+    r.raise_for_status()
+    if not r.headers.get("Content-Type", "").startswith("image/"):
+        raise RuntimeError("not an image")
+    buf = b""
+    for chunk in r.iter_content(65536):
+        buf += chunk
+        if len(buf) > max_bytes:
+            raise RuntimeError("image too large")
+    return buf
+
+
+def wikipedia_photo(query):
+    r = requests.get("https://en.wikipedia.org/w/api.php", params={
+        "action": "query", "format": "json", "generator": "search", "gsrsearch": query, "gsrlimit": 5,
+        "prop": "pageimages|info", "piprop": "thumbnail", "pithumbsize": 900, "pilimit": 5, "inprop": "url"},
+        headers=WIKI_UA, timeout=10)
+    r.raise_for_status()
+    pages = (r.json().get("query") or {}).get("pages", {})
+    for p in sorted(pages.values(), key=lambda x: x.get("index", 99)):
+        th = (p.get("thumbnail") or {}).get("source")
+        if th:
+            return {"url": th, "credit": f"Wikipedia: {p.get('title')}", "page": p.get("fullurl")}
+    return None
+
+
+def unsplash_photo(query):
+    if not UNSPLASH_KEY:
+        return None
+    r = requests.get("https://api.unsplash.com/search/photos", params={"query": query, "per_page": 1},
+                     headers={"Authorization": f"Client-ID {UNSPLASH_KEY}"}, timeout=10)
+    r.raise_for_status()
+    res = r.json().get("results") or []
+    if not res:
+        return None
+    x = res[0]
+    return {"url": x["urls"]["regular"], "credit": f"Photo by {x['user']['name']} on Unsplash",
+            "page": (x.get("links") or {}).get("html")}
+
+
+def pexels_photo(query):
+    if not PEXELS_KEY:
+        return None
+    r = requests.get("https://api.pexels.com/v1/search", params={"query": query, "per_page": 1},
+                     headers={"Authorization": PEXELS_KEY}, timeout=10)
+    r.raise_for_status()
+    res = r.json().get("photos") or []
+    if not res:
+        return None
+    x = res[0]
+    return {"url": x["src"]["large"], "credit": f"Photo by {x.get('photographer', 'unknown')} on Pexels",
+            "page": x.get("url")}
+
+
+def pixabay_photo(query):
+    if not PIXABAY_KEY:
+        return None
+    r = requests.get("https://pixabay.com/api/", params={"key": PIXABAY_KEY, "q": query, "image_type": "photo",
+                                                         "per_page": 3, "safesearch": "true"}, timeout=10)
+    r.raise_for_status()
+    res = r.json().get("hits") or []
+    if not res:
+        return None
+    x = res[0]
+    return {"url": x["largeImageURL"], "credit": f"Image by {x.get('user', 'unknown')} on Pixabay",
+            "page": x.get("pageURL")}
+
+
+def find_real_photo(query, person=False):
+    """Returns (saved_filename, credit, page_url, provider) or None. Real people: Wikipedia only (stock sites would
+    return random strangers)."""
+    order = [("wikipedia", wikipedia_photo)]
+    if not person:
+        order = [("unsplash", unsplash_photo), ("pexels", pexels_photo), ("pixabay", pixabay_photo)] + order
+    for provider, fn in order:
+        try:
+            hit = fn(query)
+            if not hit:
+                continue
+            data = _download_image(hit["url"])
+            return _save_generated(data), hit["credit"], hit.get("page"), provider
+        except Exception as e:
+            print(f"[photo] {provider} failed: {str(e)[:150]}")
+    return None
 
 
 def pollinations_image(prompt):
@@ -644,24 +852,326 @@ def generate_image(prompt):
     raise RuntimeError("; ".join(errors))
 
 
-def make_image_answer(q):
-    """Returns (answer, sources, provider, image_filename_or_None)."""
-    base = clean_image_prompt(q)
-    prompt = base
-    try:
-        better = quick_llm("You write prompts for an AI image generator. Reply with ONE vivid English prompt "
-                           "(max 50 words) and nothing else.", f"Turn this request into an image prompt: {q}")
-        better = better.strip().strip('"').strip()
-        if 5 < len(better) < 600:
-            prompt = better
-    except Exception as e:
-        print(f"[image] prompt rewrite failed: {e}")
+def make_image_answer(q, info, art_ok=True):
+    """Returns (answer, sources, provider, image_filename_or_None, usage_kind).
+    Found photos count as a normal message; AI-drawn art counts against the image limit."""
+    if info["mode"] == "clarify":
+        return ("Who or what should the picture show? Please tell me the name, for example "
+                "'photo of Ibrahim Traoré Burkina Faso'."), [], "image-clarify", None, "msg"
+    if info["mode"] == "photo":
+        try:
+            res = find_real_photo(info["query"], info.get("person", False))
+        except Exception as e:
+            print(f"[photo] search crashed: {str(e)[:150]}")
+            res = None
+        if res:
+            name, credit, page, prov = res
+            ans = f"📷 Here is a real photo for: {info['query']}\nSource: {credit}" + (f" — {page}" if page else "")
+            return ans, [], f"photo-{prov}", name, "msg"
+        if info.get("person"):
+            return (f"Sorry, I could not find a real photo of {info['query']}. I will not draw a made-up face of a real "
+                    "person because it would not look like them. Try the full name and country, for example "
+                    "'photo of Ibrahim Traoré Burkina Faso'."), [], "image-failed", None, "msg"
+        if not art_ok:
+            return ("I could not find a real photo of that, and you have used today's AI drawing limit. "
+                    "Try different words or come back tomorrow."), [], "image-failed", None, "msg"
+    if not art_ok:
+        return "You have used today's AI drawing limit.", [], "image-failed", None, "img"
+    prompt = info["query"]
     try:
         name, provider = generate_image(prompt)
-        return f"🎨 Here is your image: {base[:120]}", [], f"image-{provider}", name
+        return f"🎨 Here is your AI-drawn image: {prompt[:100]}", [], f"image-{provider}", name, "img"
     except Exception:
         return ("Sorry, I could not draw that right now because the image services are busy. "
-                "Please try again in a minute."), [], "image-failed", None
+                "Please try again in a minute."), [], "image-failed", None, "img"
+
+
+# ===========================================================================
+# FILE GENERATION (the AI writes the content, then we build a real file you can download)
+# ===========================================================================
+FILE_GEN_RE = re.compile(
+    r"\b(?:generate|create|make|write|produce|prepare|build|export|give me|draft|put (?:this|that|it) (?:in|into|as))\b[^.?!\n]{0,60}?\b"
+    r"(pdf|word (?:document|doc|file)|docx|excel(?: file| sheet)?|xlsx|spreadsheet|csv|text file|txt file|txt)\b"
+    r"|\b(?:generate|create|produce|export)\s+(?:an?\s+)?(?:\w+\s+){0,2}document\b", re.I)
+FILE_LABEL = {"docx": "Word document", "pdf": "PDF", "xlsx": "Excel file", "csv": "CSV file", "txt": "text file"}
+FILE_FALLBACK = {"pdf": ["docx", "txt"], "xlsx": ["csv", "txt"], "docx": ["txt"], "csv": ["txt"], "txt": []}
+
+
+def wants_file(q):
+    if re.match(r"^\s*(how|what|why|explain|where|when|who)\b", q, re.I):
+        return False
+    return bool(FILE_GEN_RE.search(q))
+
+
+def detect_file_format(q):
+    low = q.lower()
+    if "pdf" in low:
+        return "pdf"
+    if re.search(r"excel|xlsx|spreadsheet", low):
+        return "xlsx"
+    if "csv" in low:
+        return "csv"
+    if re.search(r"\btxt\b|text file", low):
+        return "txt"
+    return "docx"
+
+
+def plain(t):
+    return re.sub(r"(\*\*|`|(?<!\w)\*(?!\s)|(?<!\s)\*(?!\w))", "", t or "").strip()
+
+
+def md_blocks(md):
+    """Very small Markdown reader: headings, bullets, tables, paragraphs."""
+    out, para, table = [], [], []
+
+    def flush_para():
+        if para:
+            out.append(("p", " ".join(para)))
+            para.clear()
+
+    def flush_table():
+        if table:
+            rows = [[c.strip() for c in r.strip().strip("|").split("|")]
+                    for r in table if not re.match(r"^\s*\|?\s*:?-{2,}", r)]
+            if rows:
+                out.append(("table", rows))
+            table.clear()
+
+    for line in (md or "").splitlines():
+        s = line.rstrip()
+        if s.strip().startswith("|"):
+            flush_para()
+            table.append(s)
+            continue
+        flush_table()
+        if not s.strip():
+            flush_para()
+            continue
+        m = re.match(r"^(#{1,3})\s+(.*)", s)
+        if m:
+            flush_para()
+            out.append((f"h{len(m.group(1))}", m.group(2).strip()))
+            continue
+        m = re.match(r"^\s*(?:[-*•]|\d+[.)])\s+(.*)", s)
+        if m:
+            flush_para()
+            out.append(("li", m.group(1).strip()))
+            continue
+        para.append(s.strip())
+    flush_para()
+    flush_table()
+    return out
+
+
+def rows_from_md(md):
+    blocks = md_blocks(md)
+    for t, v in blocks:
+        if t == "table":
+            return v
+    rows = [[v] for t, v in blocks if t != "table"]
+    return rows or [[(md or "").strip()]]
+
+
+def build_txt(md, path):
+    lines = []
+    for t, v in md_blocks(md):
+        if t.startswith("h"):
+            lines += [plain(v).upper() if t == "h1" else plain(v), ""]
+        elif t == "li":
+            lines.append("- " + plain(v))
+        elif t == "table":
+            lines += [" | ".join(plain(c) for c in r) for r in v] + [""]
+        else:
+            lines += [plain(v), ""]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines).strip() + "\n")
+
+
+def build_csv(md, path):
+    with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        for r in rows_from_md(md):
+            w.writerow([plain(c) for c in r])
+
+
+def build_docx(md, path):
+    import docx
+    d = docx.Document()
+    for t, v in md_blocks(md):
+        if t == "h1":
+            d.add_heading(plain(v), 0)
+        elif t == "h2":
+            d.add_heading(plain(v), 1)
+        elif t == "h3":
+            d.add_heading(plain(v), 2)
+        elif t == "li":
+            d.add_paragraph(plain(v), style="List Bullet")
+        elif t == "table":
+            n = max(len(r) for r in v)
+            tbl = d.add_table(rows=len(v), cols=n)
+            tbl.style = "Table Grid"
+            for i, r in enumerate(v):
+                for j in range(n):
+                    tbl.cell(i, j).text = plain(r[j]) if j < len(r) else ""
+            d.add_paragraph("")
+        else:
+            d.add_paragraph(plain(v))
+    d.save(path)
+
+
+def build_xlsx(md, path):
+    import openpyxl
+    from openpyxl.styles import Font
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+    for r in rows_from_md(md):
+        ws.append([plain(c) for c in r])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    for col in ws.columns:
+        width = max(len(str(c.value or "")) for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 60)
+    wb.save(path)
+
+
+def build_pdf(md, path):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+    font, bold = "Helvetica", "Helvetica-Bold"
+    try:  # DejaVu (if installed) shows letters like ɛ and ɔ used in Twi
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        reg = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        bld = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        if os.path.exists(reg) and os.path.exists(bld):
+            pdfmetrics.registerFont(TTFont("MorrSans", reg))
+            pdfmetrics.registerFont(TTFont("MorrSans-Bold", bld))
+            font, bold = "MorrSans", "MorrSans-Bold"
+    except Exception:
+        pass
+    st = getSampleStyleSheet()
+    body = ParagraphStyle("b", parent=st["BodyText"], fontName=font, fontSize=11, leading=15)
+    h1 = ParagraphStyle("h1", parent=st["Title"], fontName=bold, fontSize=20, leading=24)
+    h2 = ParagraphStyle("h2", parent=st["Heading2"], fontName=bold)
+    h3 = ParagraphStyle("h3", parent=st["Heading3"], fontName=bold)
+    li = ParagraphStyle("li", parent=body, leftIndent=16, bulletIndent=4)
+    story = []
+    for t, v in md_blocks(md):
+        if t == "h1":
+            story.append(Paragraph(escape(plain(v)), h1))
+        elif t == "h2":
+            story.append(Paragraph(escape(plain(v)), h2))
+        elif t == "h3":
+            story.append(Paragraph(escape(plain(v)), h3))
+        elif t == "li":
+            story.append(Paragraph(escape(plain(v)), li, bulletText="•"))
+        elif t == "table":
+            n = max(len(r) for r in v)
+            data = [[Paragraph(escape(plain(c)), body) for c in (r + [""] * (n - len(r)))] for r in v]
+            tbl = Table(data, repeatRows=1)
+            tbl.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                                     ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+                                     ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+            story += [tbl, Spacer(1, 8)]
+        else:
+            story.append(Paragraph(escape(plain(v)), body))
+        story.append(Spacer(1, 4))
+    if not story:
+        raise RuntimeError("empty document")
+    SimpleDocTemplate(path, pagesize=A4, title="MORR AI GH document").build(story)
+
+
+BUILDERS = {"pdf": build_pdf, "docx": build_docx, "xlsx": build_xlsx, "csv": build_csv, "txt": build_txt}
+
+
+def build_file(md, fmt, title):
+    """Returns (filename, format_used, note). Falls back to an easier format if a library is missing."""
+    cleanup_old_files()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", title).strip("_")[:40] or "document"
+    last = None
+    for f in [fmt] + FILE_FALLBACK.get(fmt, []):
+        name = f"morr_{slug}_{uuid.uuid4().hex[:6]}.{f}"
+        try:
+            BUILDERS[f](md, os.path.join(GENERATED_DIR, name))
+            note = "" if f == fmt else f" (I made a {FILE_LABEL[f]} instead because the {FILE_LABEL[fmt]} tools are not installed on the server)"
+            return name, f, note
+        except Exception as e:
+            last = e
+            print(f"[file] {f} build failed: {str(e)[:200]}")
+    raise last or RuntimeError("could not build the file")
+
+
+def file_system_prompt(lang, fmt):
+    lang_rule = f"Write in {lang}." if lang and lang != "Auto" else "Write in the same language the user writes in."
+    table_rule = ("The user wants a spreadsheet, so put the data in ONE Markdown table (header row, separator row, "
+                  "then the rows) under a one-line '# Title'. " if fmt in ("xlsx", "csv") else "")
+    return ("You write the full content of a file for the user. Output ONLY the file content in simple Markdown, "
+            "with no commentary and no code fences. Start with '# Title', then '## Section' headings, short "
+            "paragraphs and '- ' bullet lists. " + table_rule +
+            "Use the web results and any attached content for facts. Never invent facts, names, numbers or links. " + lang_rule)
+
+
+def generate_file_text(q, lang, file_ctx, img_ctx, history, order, fmt):
+    topic = re.sub(r"\b(?:please|pls|can you|could you|generate|create|make|write|produce|prepare|build|export|draft|give me)\b",
+                   " ", q, flags=re.I)
+    topic = re.sub(r"\b(?:an?|the)?\s*(?:pdf|word (?:document|doc|file)|docx|excel(?: file| sheet)?|xlsx|spreadsheet|csv|text file|txt file|txt|document)\b",
+                   " ", topic, flags=re.I)
+    topic = re.sub(r"\s+", " ", topic).strip()
+    web = {"text": ""}
+    if len(topic) > 8 and not (file_ctx or img_ctx):
+        try:
+            web = web_search(topic)
+        except Exception as e:
+            print(f"[file] web search failed: {str(e)[:150]}")
+    system = file_system_prompt(lang, fmt)
+    user_text = build_user_text(q, file_ctx, img_ctx, web["text"])
+    for provider in order:
+        text = ""
+        try:
+            if provider == "gemini" and gclient:
+                contents = [types.Content(role="user" if h["role"] == "user" else "model",
+                                          parts=[types.Part(text=h["content"])]) for h in history]
+                contents.append(types.Content(role="user", parts=[types.Part(text=user_text)]))
+                text = gemini_generate(contents, system).text or ""
+            elif provider == "groq" and GROQ_KEY:
+                text = call_groq(system, history, user_text, max_tokens=3500)
+            elif provider == "openrouter" and OPENROUTER_KEY and OPENROUTER_MODEL:
+                text = call_openrouter(system, history, user_text, max_tokens=3500)
+        except Exception as e:
+            print(f"[file] {provider} failed: {str(e)[:200]}")
+        text = clean_answer(text)
+        text = re.sub(r"^```[a-zA-Z]*\s*\n|\n```\s*$", "", text.strip())
+        if len(text.strip()) > 20:
+            return text.strip()
+    return ""
+
+
+def make_file_answer(q, lang, file_ctx, img_ctx, history, order):
+    """Returns (answer, sources, provider, filename_or_None)."""
+    fmt = detect_file_format(q)
+    md = generate_file_text(q, lang, file_ctx, img_ctx, history, order, fmt)
+    if not md:
+        return ("Sorry, I could not write that file right now because the AI services are busy. "
+                "Please try again in a minute."), [], "file-failed", None
+    m = re.search(r"^#\s+(.+)$", md, re.M)
+    title = plain(m.group(1)) if m else "Your document"
+    try:
+        name, used, note = build_file(md, fmt, title)
+    except Exception as e:
+        print(f"[file] build failed: {str(e)[:200]}")
+        return "Sorry, I wrote the content but could not build the file. Please try again.", [], "file-failed", None
+    preview = re.sub(r"\s+", " ", " ".join(plain(v if isinstance(v, str) else " ".join(" ".join(r) for r in v))
+                                          for t, v in md_blocks(md)))[:450]
+    ans = f"📄 Your {FILE_LABEL[used]} is ready: {title}.{note}\n\nPreview: {preview}..."
+    return ans, [], "file-ok", name
+
+
+def friendly_name(filename):
+    return re.sub(r"^morr_", "", re.sub(r"_[0-9a-f]{6,8}(?=\.[A-Za-z0-9]+$)", "", filename))
 
 
 def build_system(lang):
@@ -682,8 +1192,10 @@ def build_system(lang):
         "If the user's question has a wrong premise, politely correct it "
         "(for example: Jamaica has a Prime Minister, not a President).\n"
         "- If you are not sure, say so plainly. Never invent facts, names, numbers or links.\n"
-        "- If a file or image is attached, use it first.\n"
-        "- You can also draw images. If the user wants one, tell them to say, for example, 'generate an image of ...'.\n"
+        "- If a file or image is attached, use it first. Only say you cannot see an image or file if none was attached.\n"
+        "- You can also find real photos, draw images and make PDF, Word, Excel, CSV and text files. If the user wants "
+        "one, tell them to say, for example, 'photo of Accra Independence Arch', 'generate an image of a sunset in Accra' "
+        "or 'create a PDF about healthy eating'.\n"
         "- Be concise. Use short paragraphs, and lists only when they help."
     )
 
@@ -722,7 +1234,7 @@ def generate_answer(q, lang, file_ctx, img_ctx, history, order=None):
         try:
             if provider == "gemini" and gclient:
                 text, srcs = call_gemini(system, history, build_user_text(q, file_ctx, img_ctx))
-                return text, srcs, "gemini"
+                return clean_answer(text), srcs, "gemini"
             if provider in ("groq", "openrouter"):
                 if provider == "groq" and not GROQ_KEY:
                     continue
@@ -735,7 +1247,7 @@ def generate_answer(q, lang, file_ctx, img_ctx, history, order=None):
                 fn = call_groq if provider == "groq" else call_openrouter
                 text = fn(system, history, user_text)
                 if text:
-                    return text, web["sources"], provider
+                    return clean_answer(text), web["sources"], provider
         except Exception as e:
             print(f"[{provider}] failed: {str(e)[:300]}")
 
@@ -757,17 +1269,17 @@ def generate_answer(q, lang, file_ctx, img_ctx, history, order=None):
 def make_audio(text, lang):
     try:
         from gtts import gTTS
-        plain = re.sub(r"https?://\S+|[*#_`>\[\]]", "", text).strip()[:350]
-        if not plain or lang == "Twi":
+        plain_text = re.sub(r"https?://\S+|[*#_`>\[\]]", "", text).strip()[:350]
+        if not plain_text or lang == "Twi":
             return None
         code = {"English": "en", "Pidgin": "en", "Hausa": "ha"}.get(lang)
         if code is None:
-            code = "en" if re.fullmatch(r"[\x00-\x7F]+", plain, re.S) else None
+            code = "en" if re.fullmatch(r"[\x00-\x7F]+", plain_text, re.S) else None
         if code is None:
             return None
         cleanup_old_files()
         name = f"morr_{uuid.uuid4().hex[:8]}.mp3"
-        gTTS(text=plain, lang=code).save(os.path.join(GENERATED_DIR, name))
+        gTTS(text=plain_text, lang=code).save(os.path.join(GENERATED_DIR, name))
         return f"/audio/{name}"
     except Exception as e:
         print(f"[tts] failed: {str(e)[:150]}")
@@ -859,7 +1371,7 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 function fmt(s){return esc(s).replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/(https?:\/\/[^\s<]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');}
 function addMsg(role,html){const d=document.createElement('div');d.className='msg '+role;d.innerHTML=html;$('chat').appendChild(d);$('chat').scrollTop=$('chat').scrollHeight;return d;}
 function srcHtml(srcs){if(!srcs||!srcs.length)return '';return '<span class="src">Sources: '+srcs.slice(0,3).map(s=>'<a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc((s.title||s.url).substring(0,40))+'</a>').join(' · ')+'</span>';}
-function welcome(){addMsg('ai','Akwaaba! I am MORR AI 🇬🇭<br>I speak English, Pidgin, Twi, Hausa and more. I can read your files and photos, and draw images too (try: generate an image of a sunset in Accra). How may I help you today?');}
+function welcome(){addMsg('ai','Akwaaba! I am MORR AI 🇬🇭<br>I speak English, Pidgin, Twi, Hausa and more. I can read your files and photos, find real photos (try: photo of Independence Arch Accra), draw images (try: generate an image of a sunset in Accra) and make files (try: create a PDF about healthy eating). How may I help you today?');}
 function toggleSide(){$('sidebar').classList.toggle('open');$('overlay').classList.toggle('open');}
 function toggleSpeak(){speak=!speak;localStorage.setItem('morr_speak',speak?'1':'0');$('spkBtn').style.opacity=speak?1:.4;}
 $('spkBtn').style.opacity=speak?1:.4;
@@ -897,6 +1409,36 @@ async function delConv(id){
  if(currentConv===id)newChat();else loadConvs();
 }
 function newChat(){currentConv=null;guestHist=[];$('chat').innerHTML='';welcome();loadConvs();if(window.innerWidth<=800&&$('sidebar').classList.contains('open'))toggleSide();}
+
+/* Sends a form (file or audio) with upload progress and a friendly error if the server is slow or restarts */
+function postForm(url,fd,onProg,timeoutMs){
+ return new Promise((resolve,reject)=>{
+  const x=new XMLHttpRequest();x.open('POST',url);x.timeout=timeoutMs||120000;
+  x.upload.onprogress=e=>{if(e.lengthComputable&&onProg)onProg(Math.round(e.loaded/e.total*100));};
+  x.onload=()=>{try{resolve(JSON.parse(x.responseText));}catch(e){reject(new Error('The server is busy or restarting ('+x.status+'). Please try again in a moment.'));}};
+  x.onerror=()=>reject(new Error('Network problem. Check your internet and try again.'));
+  x.ontimeout=()=>reject(new Error('This is taking too long. Please try again.'));
+  x.send(fd);
+ });
+}
+/* Shrinks big photos in the browser before upload (a 4 MB phone photo becomes about 200 KB) */
+function compressImage(file,maxDim,quality){
+ return new Promise(resolve=>{
+  if(!/^image\/(jpeg|png|webp)$/.test(file.type)||file.size<250*1024){resolve(file);return;}
+  const img=new Image();const url=URL.createObjectURL(file);
+  img.onload=()=>{
+   const s=Math.min(1,maxDim/Math.max(img.width,img.height));
+   const w=Math.max(1,Math.round(img.width*s)),h=Math.max(1,Math.round(img.height*s));
+   const c=document.createElement('canvas');c.width=w;c.height=h;const ctx=c.getContext('2d');
+   ctx.fillStyle='#fff';ctx.fillRect(0,0,w,h);ctx.drawImage(img,0,0,w,h);
+   c.toBlob(b=>{URL.revokeObjectURL(url);
+    if(b&&b.size<file.size)resolve(new File([b],file.name.replace(/\.\w+$/,'')+'.jpg',{type:'image/jpeg'}));else resolve(file);
+   },'image/jpeg',quality);
+  };
+  img.onerror=()=>{URL.revokeObjectURL(url);resolve(file);};
+  img.src=url;
+ });
+}
 async function send(){
  if(busy)return;
  const i=$('q');const q=i.value.trim();
@@ -908,50 +1450,71 @@ async function send(){
   conversation_id:currentConv,history:LOGGED_IN?[]:guestHist,speak:speak};
  attachText='';attachImg='';attachName='';$('fileInput').value='';
  try{
-  const res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const data=await res.json();$('status').innerText='';
+  const ctl=new AbortController();const tm=setTimeout(()=>ctl.abort(),150000);
+  const res=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctl.signal});
+  clearTimeout(tm);
+  let data;try{data=await res.json();}catch(e){throw new Error('The server is busy or restarting. Please try again in a moment.');}
+  $('status').innerText='';
   if(data.limit){addMsg('ai',fmt(data.answer)+'<br><a href="'+esc(data.upgrade_url)+'">'+(data.upgrade_url==='/signup'?'Create a free account':'⭐ See Premium')+'</a>');busy=false;loadUsage();return;}
-  const extra=data.image_url?'<br><img src="'+esc(data.image_url)+'"><br><a href="'+esc(data.download_url||data.image_url)+'">⬇️ Download image</a>':'';
+  let extra='';
+  if(data.image_url)extra+='<br><img src="'+esc(data.image_url)+'"><br><a href="'+esc(data.download_url||data.image_url)+'">⬇️ Download image</a>';
+  if(data.file_url)extra+='<br><a href="'+esc(data.file_url)+'">⬇️ Download '+esc(data.file_name||'file')+'</a>';
   addMsg('ai',fmt(data.answer||'No answer')+extra+srcHtml(data.sources));
   if(LOGGED_IN&&data.conversation_id){currentConv=data.conversation_id;loadConvs();}
   if(!LOGGED_IN){guestHist.push({role:'user',content:q},{role:'assistant',content:data.answer||''});guestHist=guestHist.slice(-10);}
   if(data.audio_url){const p=$('player');p.style.display='block';p.src=data.audio_url;p.play().catch(()=>{});}
- }catch(e){$('status').innerText='';addMsg('ai','Error: '+esc(e.message));}
+ }catch(e){$('status').innerText='';addMsg('ai','Error: '+esc(e.name==='AbortError'?'That took too long. Please try again.':e.message));}
  busy=false;loadUsage();
 }
 async function handleFile(){
- const f=$('fileInput').files[0];if(!f)return;
- $('status').innerText='Reading '+f.name+'...';
- const fd=new FormData();fd.append('file',f);
+ let f=$('fileInput').files[0];if(!f)return;
+ const origName=f.name;
  try{
-  const data=await (await fetch('/upload',{method:'POST',body:fd})).json();
+  let localPrev=null;
+  if(/^image\//.test(f.type)){
+   $('status').innerText='Preparing '+origName+'...';
+   localPrev=URL.createObjectURL(f);
+   f=await compressImage(f,1280,0.8);
+  }
+  const kb=Math.max(1,Math.round(f.size/1024));
+  $('status').innerText='Uploading '+origName+' ('+kb+' KB)...';
+  const fd=new FormData();fd.append('file',f);
+  const data=await postForm('/upload',fd,p=>{$('status').innerText=p<100?('Uploading '+origName+'... '+p+'%'):('Reading '+origName+'... this can take a few seconds');},150000);
   if(data.error){$('status').innerText='';addMsg('ai','⚠️ '+esc(data.error)+(data.upgrade_url?'<br><a href="'+esc(data.upgrade_url)+'">'+(data.upgrade_url==='/signup'?'Create a free account':'⭐ See Premium')+'</a>':''));loadUsage();attachText='';attachImg='';attachName='';return;}
-  attachText=data.text||'';attachImg=data.image_desc||'';attachName=f.name;
-  $('status').innerText='✅ '+f.name+' attached. Now type your question (or just press send).';loadUsage();
-  if(data.preview)addMsg('user','📎 '+esc(f.name)+'<br><img src="'+data.preview+'">');
-  else addMsg('user','📎 '+esc(f.name));
- }catch(e){$('status').innerText='⚠️ Upload failed: '+e.message;}
+  attachText=data.text||'';attachImg=data.image_desc||'';attachName=origName;
+  $('status').innerText='✅ '+origName+' attached. Now type your question (or just press send).';loadUsage();
+  const pv=data.preview||localPrev;
+  if(pv)addMsg('user','📎 '+esc(origName)+'<br><img src="'+pv+'">');
+  else addMsg('user','📎 '+esc(origName));
+ }catch(e){attachText='';attachImg='';attachName='';$('status').innerText='⚠️ Upload failed: '+e.message;}
 }
 async function toggleMic(){
  const btn=$('micBtn');
  try{
   if(!recording){
+   if(!navigator.mediaDevices||!window.MediaRecorder){$('status').innerText='Voice recording is not supported in this browser. Try Chrome or Safari.';return;}
    const s=await navigator.mediaDevices.getUserMedia({audio:true});
-   recMime=MediaRecorder.isTypeSupported('audio/webm')?'audio/webm':(MediaRecorder.isTypeSupported('audio/mp4')?'audio/mp4':'');
+   const pref=['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg'];
+   recMime=pref.find(t=>MediaRecorder.isTypeSupported(t))||'';
    recorder=recMime?new MediaRecorder(s,{mimeType:recMime}):new MediaRecorder(s);chunks=[];
-   recorder.ondataavailable=e=>chunks.push(e.data);
+   recorder.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data);};
    recorder.onstop=async()=>{
-    const type=recorder.mimeType||recMime||'audio/webm';const ext=type.includes('mp4')?'m4a':'webm';
-    const fd=new FormData();fd.append('audio',new Blob(chunks,{type}),'voice.'+ext);fd.append('language',$('lang').value);
-    $('status').innerText='Transcribing...';
-    try{const d=await (await fetch('/voice',{method:'POST',body:fd})).json();
-     if(d.text){$('q').value=d.text;$('status').innerText='';send();}else{$('status').innerText=d.error||'Could not understand the audio, try again.';}
-    }catch(e){$('status').innerText='Voice failed: '+e.message;}
     s.getTracks().forEach(t=>t.stop());
+    const type=(recorder.mimeType||recMime||'audio/webm').split(';')[0];
+    const ext=type.includes('mp4')?'m4a':(type.includes('ogg')?'ogg':'webm');
+    const blob=new Blob(chunks,{type});
+    if(blob.size<1500){$('status').innerText='That was too short. Tap the mic, speak, then tap again to stop.';return;}
+    const fd=new FormData();fd.append('audio',blob,'voice.'+ext);fd.append('language',$('lang').value);
+    $('status').innerText='Transcribing...';
+    try{
+     const d=await postForm('/voice',fd,null,60000);
+     if(d.text){$('q').value=d.text;$('status').innerText='';send();}
+     else{$('status').innerText=d.error||'Could not understand the audio, please try again.';}
+    }catch(e){$('status').innerText='Voice failed: '+e.message;}
    };
-   recorder.start();recording=true;btn.innerText='🔴';
+   recorder.start();recording=true;btn.innerText='🔴';$('status').innerText='Listening... tap 🔴 when you finish';
   }else{recorder.stop();recording=false;btn.innerText='🎤';}
- }catch(e){$('status').innerText='Mic error: '+e.message;}
+ }catch(e){recording=false;btn.innerText='🎤';$('status').innerText='Mic error: '+e.message;}
 }
 $('q').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
 async function loadUsage(){
@@ -962,8 +1525,9 @@ async function loadUsage(){
    h+=(u.days_left!=null&&u.days_left<=3&&!u.auto_renew)?'<br><a href="/pricing">Renew now</a>':'<br><a href="/pricing">Manage plan</a>';
   }else{
    h='<b>'+(u.plan==='guest'?'Guest':'Free plan')+'</b> · today<br>Messages '+(U.msg||0)+'/'+L.msg;
-   if(L.img)h+='<br>Images '+(U.img||0)+'/'+L.img;else h+='<br>Images and uploads need a free account';
+   if(L.img)h+='<br>Images '+(U.img||0)+'/'+L.img;else h+='<br>Images, files and uploads need a free account';
    if(L.upload)h+='<br>Uploads '+(U.upload||0)+'/'+L.upload;
+   if(L.file)h+='<br>Files '+(U.file||0)+'/'+L.file;
    h+=u.plan==='guest'?'<br><a href="/signup">Create free account</a>':'<br><a href="/pricing">⭐ Go Premium</a>';
   }
   $('usageBox').innerHTML=h;
@@ -1197,7 +1761,8 @@ def check_limit(uid, email, kind):
     return used < limit, plan, used, limit
 
 
-KIND_NAME = {"msg": "messages", "img": "image generations", "upload": "file uploads", "voice": "voice messages"}
+KIND_NAME = {"msg": "messages", "img": "image generations", "upload": "file uploads", "voice": "voice messages",
+             "file": "file creations"}
 
 
 def limit_response(plan, kind, limit):
@@ -1493,11 +2058,12 @@ PRICING_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="
 {% if plan == 'premium' %}<div class="ok">⭐ You are on Premium{% if info.until %} until {{ info.until }}{% if info.auto_renew %} (auto-renews){% endif %}{% endif %}.</div>{% endif %}
 <div class="cards">
  <div class="card"><h2>Free</h2><div class="price">GHS 0</div>
-  <ul><li>{{ limits.free.msg }} messages a day</li><li>{{ limits.free.img }} image generations a day</li>
+  <ul><li>{{ limits.free.msg }} messages a day</li><li>{{ limits.free.img }} AI image generations a day</li>
+  <li>{{ limits.free.file }} PDF, Word or Excel file creations a day</li>
   <li>{{ limits.free.upload }} file or photo uploads a day (up to {{ free_mb }} MB)</li><li>Saved chat history</li></ul>
   {% if not logged_in %}<a href="/signup"><button class="alt" type="button">Create free account</button></a>{% endif %}</div>
  <div class="card prem"><h2>⭐ Premium</h2><div class="price">GHS {{ '%.2f'|format(price) }} <span style="font-size:14px;color:#aaa">/ month</span></div>
-  <ul><li>Unlimited messages*</li><li>Unlimited image generations*</li><li>Unlimited file and photo uploads* (up to {{ prem_mb }} MB)</li>
+  <ul><li>Unlimited messages*</li><li>Unlimited AI image generations*</li><li>Unlimited PDF, Word and Excel creation*</li><li>Unlimited file and photo uploads* (up to {{ prem_mb }} MB)</li>
   <li>Priority access to our best AI model</li><li>Saved chat history</li></ul>
   <div style="font-size:12px;color:#888">*Fair use applies.</div>
   {% if not logged_in %}<a href="/login"><button type="button">Log in to upgrade</button></a>
@@ -1538,7 +2104,7 @@ LEGAL_HTML = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="vi
 </div></body></html>"""
 
 TERMS = [
-    ("The service", "MORR AI GH is an AI chat assistant that can answer questions, read files and photos and generate images. AI answers can be wrong, so check important information before relying on it."),
+    ("The service", "MORR AI GH is an AI chat assistant that can answer questions, read files and photos, find photos online, generate images and create documents. AI answers can be wrong, so check important information before relying on it. Photos found online belong to their owners and are shown with their source."),
     ("Accounts", "You must give a real email address and keep your password private. You are responsible for activity on your account."),
     ("Acceptable use", "Do not use MORR AI GH for anything illegal, abusive, harmful or deceptive, or to attack or overload the service. We may limit or close accounts that break these rules."),
     ("Plans and limits", "Free accounts have daily limits that reset at midnight (Ghana time). Premium is GHS 53.00 per month and is described as unlimited, subject to fair use."),
@@ -1547,9 +2113,9 @@ TERMS = [
     ("Contact", "[Your business name, address and support email.]"),
 ]
 PRIVACY = [
-    ("What we collect", "Your email address, a scrambled (hashed) version of your password, your chats, files and images you upload for processing, and records of your payments (reference, amount, date). We do not see or store your card or Mobile Money details; Paystack handles those."),
+    ("What we collect", "Your email address, a scrambled (hashed) version of your password, your chats, files, images and voice recordings you send for processing, and records of your payments (reference, amount, date). We do not see or store your card or Mobile Money details; Paystack handles those."),
     ("How we use it", "To run your account, answer your questions, save your chat history, enforce plan limits and process payments."),
-    ("Who we share it with", "Your messages, and any files or images you send, are processed by our AI and search providers (for example Google Gemini and Groq) and our hosting and database providers. Payments are processed by Paystack. [List any others you add.]"),
+    ("Who we share it with", "Your messages, and any files, images or voice recordings you send, are processed by our AI and search providers (for example Google Gemini and Groq) and our hosting and database providers. Image searches are sent to Wikipedia and any photo sites we enable. Payments are processed by Paystack. [List any others you add.]"),
     ("How long we keep it", "[Say how long you keep chats and account data, and how users can ask for deletion.]"),
     ("Your rights", "[Explain how users can access, correct or delete their data, in line with Ghana's Data Protection Act. Ask a lawyer to check this and whether you must register with the Data Protection Commission.]"),
     ("Contact", "[Your support email.]"),
@@ -1569,6 +2135,9 @@ def privacy_page():
 # ===========================================================================
 # ASK
 # ===========================================================================
+NO_COUNT = {"none", "image-failed", "image-clarify", "file-failed"}
+
+
 @app.route("/ask", methods=["POST"])
 def ask_route():
     d = request.get_json(silent=True) or {}
@@ -1586,11 +2155,15 @@ def ask_route():
 
     uid = current_user()
     email_now = session.get("email")
-    is_img = not (file_ctx or img_ctx) and wants_image(q)
-    kind = "img" if is_img else "msg"
+    has_att = bool(file_ctx or img_ctx)
+    is_file = wants_file(q)
+    is_img = (not is_file) and (not has_att) and wants_image(q)
+    kind = "file" if is_file else "msg"
     allowed, plan, used, limit = check_limit(uid, email_now, kind)
     if not allowed:
         return jsonify(limit_response(plan, kind, limit)), 429
+    art_ok = check_limit(uid, email_now, "img")[0] if is_img else True
+
     conv_id = d.get("conversation_id")
     history = []
     try:
@@ -1607,19 +2180,31 @@ def ask_route():
         print(f"[ask] history load failed: {e}")
         conv_id = None
 
-    image_name = None
-    if is_img:
-        ans, sources, provider, image_name = make_image_answer(q)
+    # The person talks about an attachment that never arrived: say so clearly instead of letting the AI guess
+    if not has_att and not history and ATTACH_REF_RE.search(q):
+        return jsonify({"answer": "I do not see an attachment yet. Tap the 📎 button, pick your picture or file, wait "
+                                  "for the ✅ message, then ask your question again."})
+
+    order = PROVIDER_ORDER if plan == "premium" else FREE_PROVIDER_ORDER
+    image_name = file_name = None
+    used_kind = "msg"
+    if is_file:
+        ans, sources, provider, file_name = make_file_answer(q, lang, file_ctx, img_ctx, history, order)
+        used_kind = "file"
+    elif is_img:
+        info = plan_image(q, history)
+        if info["mode"] == "art" and not art_ok:
+            return jsonify(limit_response(plan, "img", LIMITS[plan]["img"])), 429
+        ans, sources, provider, image_name, used_kind = make_image_answer(q, info, art_ok)
     else:
         try:
-            ans, sources, provider = generate_answer(q, lang, file_ctx, img_ctx, history,
-                                                     PROVIDER_ORDER if plan == "premium" else FREE_PROVIDER_ORDER)
+            ans, sources, provider = generate_answer(q, lang, file_ctx, img_ctx, history, order)
         except Exception as e:
             print(f"[ask] unexpected failure: {e}")
             return jsonify({"answer": "Something went wrong on my side. Please try again."}), 500
     print(f"[ask] answered by {provider}")
-    if provider not in ("none", "image-failed"):
-        add_usage(usage_key(uid), kind)
+    if provider not in NO_COUNT:
+        add_usage(usage_key(uid), used_kind)
 
     if uid:
         try:
@@ -1637,10 +2222,12 @@ def ask_route():
         except Exception as e:
             print(f"[ask] saving chat failed: {e}")
 
-    audio_url = make_audio(ans, lang) if d.get("speak") and not image_name else None
+    audio_url = make_audio(ans, lang) if d.get("speak") and not image_name and not file_name else None
     return jsonify({"answer": ans, "sources": sources, "audio_url": audio_url, "conversation_id": conv_id,
                     "image_url": f"/media/{image_name}" if image_name else None,
-                    "download_url": f"/download/{image_name}" if image_name else None})
+                    "download_url": f"/download/{image_name}" if image_name else None,
+                    "file_url": f"/download/{file_name}" if file_name else None,
+                    "file_name": friendly_name(file_name) if file_name else None})
 
 
 # ===========================================================================
@@ -1670,11 +2257,12 @@ def upload():
     ext = os.path.splitext(safe.lower())[1]
     tmp = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex[:8]}_{safe}")
     f.save(tmp)
+    t0 = time.time()
     text, img_desc, preview = "", "", None
     try:
         if ext in IMG_EXT:
-            from PIL import Image
-            im = Image.open(tmp).convert("RGB")
+            from PIL import Image, ImageOps
+            im = ImageOps.exif_transpose(Image.open(tmp)).convert("RGB")  # fixes sideways phone photos
             big = im.copy()
             big.thumbnail((1600, 1600))
             buf = io.BytesIO()
@@ -1687,7 +2275,7 @@ def upload():
             if not (gclient or GROQ_KEY):
                 return jsonify({"error": "Image reading needs GEMINI_API_KEY or GROQ_API_KEY to be set."})
             try:
-                img_desc = describe_image(buf.getvalue())
+                img_desc = clean_answer(describe_image(buf.getvalue()))
             except Exception as e:
                 print(f"[upload] image read failed: {str(e)[:300]}")
                 return jsonify({"error": "Both of my image readers are busy or at their daily limit. Please try again in a few minutes."})
@@ -1725,6 +2313,7 @@ def upload():
             os.remove(tmp)
         except OSError:
             pass
+    print(f"[upload] {ext} processed in {time.time() - t0:.1f}s")
     add_usage(usage_key(uid_u), "upload")
     return jsonify({"text": text, "image_desc": img_desc, "preview": preview})
 
@@ -1733,29 +2322,50 @@ def upload():
 def voice():
     f = request.files.get("audio")
     if not f:
-        return jsonify({"text": ""})
+        return jsonify({"text": "", "error": "No audio was received. Please try again."})
     uid_v = current_user()
     allowed, plan_v, used_v, limit_v = check_limit(uid_v, session.get("email"), "voice")
     if not allowed:
         r = limit_response(plan_v, "voice", limit_v)
         return jsonify({"text": "", "error": r["error"], "upgrade_url": r["upgrade_url"]}), 429
     data = f.read()
+    if len(data) < 1500:
+        return jsonify({"text": "", "error": "That recording was too short. Tap the mic, speak, then tap again to stop."})
     mime = (f.mimetype or "audio/webm").split(";")[0]
     if not mime.startswith("audio/"):
         mime = "audio/webm"
-    txt = ""
-    try:
-        if gclient and data:
+    ext = "m4a" if ("mp4" in mime or "m4a" in mime or "aac" in mime) else ("ogg" if "ogg" in mime else
+          ("wav" if "wav" in mime else ("mp3" if ("mpeg" in mime or "mp3" in mime) else "webm")))
+    lang = request.form.get("language") or "Auto"
+    hint = {"English": "en", "Pidgin": "en", "Hausa": "ha"}.get(lang)
+    txt, errors = "", []
+    if GROQ_KEY:  # Whisper accepts webm, mp4/m4a, ogg, wav, mp3 and flac
+        try:
+            txt = groq_transcribe(data, f"voice.{ext}", mime, hint)
+        except Exception as e:
+            errors.append(f"groq: {str(e)[:200]}")
+            print(f"[voice] groq whisper failed: {str(e)[:300]}")
+    if not txt and gclient:
+        try:
             resp = gemini_generate([types.Content(role="user", parts=[
                 types.Part.from_bytes(data=data, mime_type=mime),
                 types.Part(text="Transcribe this audio exactly as spoken, in its original language "
                                 "(English, Pidgin, Twi, Hausa or other). Return only the transcription.")])])
-            txt = resp.text or ""
-    except Exception as e:
-        print(f"[voice] failed: {str(e)[:300]}")
-    if txt.strip():
+            txt = (resp.text or "").strip()
+        except Exception as e:
+            errors.append(f"gemini: {str(e)[:200]}")
+            print(f"[voice] gemini failed: {str(e)[:300]}")
+    txt = clean_answer(txt)
+    if txt:
         add_usage(usage_key(uid_v), "voice")
-    return jsonify({"text": txt.strip()})
+        return jsonify({"text": txt})
+    if not (GROQ_KEY or gclient):
+        msg = "Voice typing is not set up on the server yet (it needs GROQ_API_KEY or GEMINI_API_KEY)."
+    elif errors:
+        msg = "Voice typing is busy right now. Please try again in a moment, or type your message."
+    else:
+        msg = "I could not hear any speech in that recording. Please speak closer to the mic and try again."
+    return jsonify({"text": "", "error": msg})
 
 
 @app.route("/media/<filename>")
@@ -1768,9 +2378,10 @@ def media(filename):
 
 @app.route("/download/<filename>")
 def dl(filename):
-    p = os.path.join(GENERATED_DIR, secure_filename(filename))
+    safe = secure_filename(filename)
+    p = os.path.join(GENERATED_DIR, safe)
     if os.path.exists(p):
-        return send_file(p, as_attachment=True)
+        return send_file(p, as_attachment=True, download_name=friendly_name(safe))
     return "not found", 404
 
 
