@@ -9,3 +9,5 @@ requests
 beautifulsoup4
 ddgs
 psycopg2-binary
+reportlab
+openpyxl
